@@ -1,0 +1,5 @@
+-keep class com.coara.simpleapkinstaller.MainActivity { *; }
+-keep class com.coara.simpleapkinstaller.model.** { *; }
+-keep class com.coara.simpleapkinstaller.util.** { *; }
+-keep class com.android.apksig.** { *; }
+-keepattributes *Annotation*,InnerClasses,EnclosingMethod,Signature,Exceptions,SourceFile,LineNumberTable

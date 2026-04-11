@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="24dp"
+    android:gravity="center_horizontal"
+    android:background="@android:color/white">
+
+    <Button
+        android:id="@+id/btn_select"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="ファイルを選択"
+        android:textSize="18sp"
+        android:textColor="@android:color/white"
+        android:backgroundTint="#2196F3" />
+
+    <ImageView
+        android:id="@+id/iv_icon"
+        android:layout_width="96dp"
+        android:layout_height="96dp"
+        android:layout_marginTop="32dp"
+        android:scaleType="fitCenter"
+        android:src="@android:drawable/sym_def_app_icon" />
+
+    <TextView
+        android:id="@+id/tv_file_name"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:text="ファイルを選択してください"
+        android:textSize="18sp"
+        android:textStyle="bold"
+        android:gravity="center"
+        android:textColor="#212121" />
+
+    <TextView
+        android:id="@+id/tv_size"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text=""
+        android:textSize="16sp"
+        android:gravity="center"
+        android:textColor="#757575" />
+
+    <Button
+        android:id="@+id/btn_select_splits"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:text="インストール対象のAPKを選択"
+        android:textSize="16sp"
+        android:visibility="gone"
+        android:textColor="@android:color/white"
+        android:backgroundTint="#FF9800" />
+
+    <Button
+        android:id="@+id/btn_install"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="32dp"
+        android:text="インストール"
+        android:textSize="18sp"
+        android:enabled="false"
+        android:textColor="@android:color/white"
+        android:backgroundTint="#4CAF50" />
+
+    <TextView
+        android:id="@+id/tv_status"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="24dp"
+        android:text=""
+        android:textSize="16sp"
+        android:gravity="center"
+        android:textColor="#FF5722" />
+
+</LinearLayout>
