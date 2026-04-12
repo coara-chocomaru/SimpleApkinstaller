@@ -55,6 +55,8 @@ public final class FileUtils {
         return n;
     }
 
+    private static final int TRANSFER_BUFFER_SIZE = 64 * 1024;
+
     public static boolean copyUriToFile(Context context, Uri uri, File dest) {
         if (context == null || uri == null || dest == null) return false;
         InputStream is = null;
@@ -65,10 +67,12 @@ public final class FileUtils {
             if (is == null) return false;
 
             File parent = dest.getParentFile();
-            if (parent != null && !parent.exists()) parent.mkdirs();
+            if (parent != null && !parent.exists() && !parent.mkdirs() && !parent.exists()) {
+                return false;
+            }
 
             os = new BufferedOutputStream(new FileOutputStream(dest));
-            byte[] buffer = new byte[8192];
+            byte[] buffer = new byte[TRANSFER_BUFFER_SIZE];
             int len;
             while ((len = is.read(buffer)) > 0) os.write(buffer, 0, len);
             os.flush();
@@ -90,12 +94,28 @@ public final class FileUtils {
             }
             try (InputStream fis = new BufferedInputStream(new FileInputStream(src));
                  OutputStream fos = new BufferedOutputStream(new FileOutputStream(dst))) {
-                byte[] buffer = new byte[8192];
+                byte[] buffer = new byte[TRANSFER_BUFFER_SIZE];
                 int len;
                 while ((len = fis.read(buffer)) > 0) fos.write(buffer, 0, len);
                 fos.flush();
             }
             return true;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    public static boolean moveFile(File src, File dst) {
+        if (src == null || dst == null || !src.exists()) return false;
+        try {
+            File parent = dst.getParentFile();
+            if (parent != null && !parent.exists() && !parent.mkdirs() && !parent.exists()) {
+                return false;
+            }
+            if (dst.exists()) deleteRecursive(dst);
+            if (src.renameTo(dst)) return true;
+            if (copyFile(src, dst)) return src.delete();
+            return false;
         } catch (Exception ignored) {
             return false;
         }
@@ -133,14 +153,20 @@ public final class FileUtils {
         } catch (Exception ignored) {}
     }
 
-    public static void deleteRecursive(File file) {
-        if (file == null || !file.exists()) return;
+    public static boolean deleteRecursive(File file) {
+        if (file == null || !file.exists()) return true;
+        boolean ok = true;
         if (file.isDirectory()) {
             File[] list = file.listFiles();
             if (list != null) {
-                for (File child : list) deleteRecursive(child);
+                for (File child : list) ok &= deleteRecursive(child);
             }
         }
-        try { file.delete(); } catch (Exception ignored) {}
+        try {
+            if (file.exists() && !file.delete()) ok = false;
+        } catch (Exception ignored) {
+            ok = false;
+        }
+        return ok;
     }
 }

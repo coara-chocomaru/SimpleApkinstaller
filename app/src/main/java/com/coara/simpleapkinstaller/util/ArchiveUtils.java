@@ -35,7 +35,30 @@ import java.util.zip.ZipFile;
 public final class ArchiveUtils {
     private static volatile java.util.Set<String> KNOWN_LANGUAGE_CODES;
 
+    private static final class ArchiveLayoutScan {
+        boolean hasSaiMeta;
+        boolean hasBundletoolLayout;
+        boolean hasApkmLayout;
+        boolean hasXapkLayout;
+        boolean hasApk;
+        boolean hasJson;
+        boolean hasObb;
+        ZipEntry metaEntry;
+    }
+
     private ArchiveUtils() {}
+
+    public static final class ArchiveInspection {
+        public final ArchiveKind kind;
+        public final ArchiveMetadata metadata;
+        public final boolean containsObb;
+
+        public ArchiveInspection(ArchiveKind kind, ArchiveMetadata metadata, boolean containsObb) {
+            this.kind = kind;
+            this.metadata = metadata != null ? metadata : new ArchiveMetadata();
+            this.containsObb = containsObb;
+        }
+    }
 
 
     private enum SplitCategory {
@@ -170,37 +193,7 @@ public final class ArchiveUtils {
     }
 
     public static ArchiveMetadata readArchiveMetadataFromZip(File archiveFile) {
-
-        ArchiveMetadata meta = new ArchiveMetadata();
-        if (archiveFile == null || !archiveFile.exists()) return meta;
-
-        try (ZipFile zipFile = new ZipFile(archiveFile)) {
-            ZipEntry metaEntry = findFirstExistingEntry(zipFile,
-                    "meta.sai_v2.json",
-                    "meta.sai_v1.json",
-                    "info.json",
-                    "manifest.json");
-            if (metaEntry == null) return meta;
-
-            String json = readZipEntryAsString(zipFile, metaEntry);
-            if (TextUtils.isEmpty(json)) return meta;
-
-            JSONObject obj = new JSONObject(json);
-            meta.packageName = readStringFromJson(obj, "package_name", "package", "packageName");
-            meta.appName = readStringFromJson(obj, "name", "label", "app_name", "appName");
-            meta.versionName = readStringFromJson(obj, "version_name", "versionName");
-            meta.baseApkHint = readBaseApkHint(obj);
-            meta.splitHints.addAll(readSplitHints(obj));
-
-            if (obj.has("version_code")) {
-                meta.versionCode = parseLongSafely(obj.opt("version_code"), meta.versionCode);
-            } else if (obj.has("versionCode")) {
-                meta.versionCode = parseLongSafely(obj.opt("versionCode"), meta.versionCode);
-            }
-            return meta;
-        } catch (Exception e) {
-            return meta;
-        }
+        return inspectArchive(archiveFile).metadata;
     }
 
     private static long parseLongSafely(Object value, long fallback) {
@@ -265,33 +258,108 @@ public final class ArchiveUtils {
     }
 
     public static ArchiveKind detectArchiveKind(File archiveFile) {
-        if (archiveFile == null || !archiveFile.exists()) return ArchiveKind.ZIP_UNKNOWN;
+        return inspectArchive(archiveFile).kind;
+    }
+
+    public static ArchiveInspection inspectArchive(File archiveFile) {
+        if (archiveFile == null || !archiveFile.exists()) {
+            return new ArchiveInspection(ArchiveKind.ZIP_UNKNOWN, new ArchiveMetadata(), false);
+        }
 
         String lowerName = FileUtils.safeLower(archiveFile.getName());
+        ArchiveLayoutScan scan = new ArchiveLayoutScan();
         try (ZipFile zipFile = new ZipFile(archiveFile)) {
-            boolean hasSaiMeta = findEntryByExactName(zipFile, "meta.sai_v1.json") != null
-                    || findEntryByExactName(zipFile, "meta.sai_v2.json") != null;
-            boolean hasBundletoolLayout = findEntryByExactName(zipFile, "toc.pb") != null
-                    || findEntryByExactName(zipFile, "toc.json") != null
-                    || findEntryByPrefix(zipFile, "splits/") != null
-                    || findEntryByPrefix(zipFile, "standalones/") != null;
-            boolean hasApkmLayout = findEntryByExactName(zipFile, "info.json") != null
-                    || findEntryByExactName(zipFile, "APKM_installer.url") != null
-                    || findEntryByPrefix(zipFile, "META-INF/") != null
-                    || lowerName.endsWith(".apkm");
-            boolean hasXapkLayout = findEntryByExactName(zipFile, "manifest.json") != null
-                    || findEntryByPrefix(zipFile, "Android/obb/") != null;
+            Enumeration<? extends ZipEntry> entries = zipFile.entries();
+            while (entries.hasMoreElements()) {
+                ZipEntry entry = entries.nextElement();
+                if (entry == null || entry.isDirectory()) continue;
 
-            if (hasBundletoolLayout) return ArchiveKind.APKS_BUNDLETOOL;
-            if (hasSaiMeta) return ArchiveKind.APKS_SAI;
-            if (hasApkmLayout) return ArchiveKind.APKM;
-            if (hasXapkLayout) return ArchiveKind.XAPK;
-        } catch (Exception ignored) {}
+                String name = FileUtils.safeLower(entry.getName().replace('\\', '/'));
+                if (name.endsWith(".apk")) scan.hasApk = true;
+                if (name.endsWith(".json")) scan.hasJson = true;
+                if (name.endsWith(".obb") || name.startsWith("android/obb/") || name.contains("/android/obb/")) scan.hasObb = true;
 
-        if (lowerName.endsWith(".apks")) return ArchiveKind.APKS_BUNDLETOOL;
-        if (lowerName.endsWith(".apkm")) return ArchiveKind.APKM;
-        if (lowerName.endsWith(".xapk")) return ArchiveKind.XAPK;
-        return ArchiveKind.ZIP_UNKNOWN;
+                if (scan.metaEntry == null && ("meta.sai_v1.json".equals(name) || "meta.sai_v2.json".equals(name)
+                        || "info.json".equals(name) || "manifest.json".equals(name))) {
+                    scan.metaEntry = entry;
+                }
+                if ("meta.sai_v1.json".equals(name) || "meta.sai_v2.json".equals(name)) scan.hasSaiMeta = true;
+                if ("toc.pb".equals(name) || "toc.json".equals(name) || name.startsWith("splits/") || name.startsWith("standalones/")) {
+                    scan.hasBundletoolLayout = true;
+                }
+                if ("info.json".equals(name) || "apkm_installer.url".equals(name)) scan.hasApkmLayout = true;
+                if ("manifest.json".equals(name) || name.startsWith("android/obb/") || name.contains("/android/obb/")) scan.hasXapkLayout = true;
+            }
+
+            if (scan.hasObb) scan.hasXapkLayout = true;
+
+            ArchiveKind kind;
+            if (scan.hasBundletoolLayout) kind = ArchiveKind.APKS_BUNDLETOOL;
+            else if (scan.hasSaiMeta) kind = ArchiveKind.APKS_SAI;
+            else if (scan.hasApkmLayout) kind = ArchiveKind.APKM;
+            else if (scan.hasXapkLayout) kind = ArchiveKind.XAPK;
+            else if (lowerName.endsWith(".apks")) kind = ArchiveKind.APKS_BUNDLETOOL;
+            else if (lowerName.endsWith(".apkm")) kind = ArchiveKind.APKM;
+            else if (lowerName.endsWith(".xapk")) kind = ArchiveKind.XAPK;
+            else if (lowerName.endsWith(".zip") && scan.hasApk && scan.hasJson) kind = ArchiveKind.ZIP_UNKNOWN;
+            else kind = ArchiveKind.ZIP_UNKNOWN;
+
+            ArchiveMetadata meta = new ArchiveMetadata();
+            if (scan.metaEntry != null) {
+                String json = readZipEntryAsString(zipFile, scan.metaEntry);
+                if (!TextUtils.isEmpty(json)) {
+                    try {
+                        JSONObject obj = new JSONObject(json);
+                        meta.packageName = readStringFromJson(obj, "package_name", "package", "packageName");
+                        meta.appName = readStringFromJson(obj, "name", "label", "app_name", "appName");
+                        meta.versionName = readStringFromJson(obj, "version_name", "versionName");
+                        meta.baseApkHint = readBaseApkHint(obj);
+                        meta.splitHints.addAll(readSplitHints(obj));
+                        if (obj.has("version_code")) {
+                            meta.versionCode = parseLongSafely(obj.opt("version_code"), meta.versionCode);
+                        } else if (obj.has("versionCode")) {
+                            meta.versionCode = parseLongSafely(obj.opt("versionCode"), meta.versionCode);
+                        }
+                    } catch (Exception ignored) {
+                    }
+                }
+            }
+            return new ArchiveInspection(kind, meta, scan.hasObb);
+        } catch (Exception e) {
+            return new ArchiveInspection(ArchiveKind.ZIP_UNKNOWN, new ArchiveMetadata(), false);
+        }
+    }
+
+    private static ArchiveLayoutScan scanArchiveLayout(ZipFile zipFile) {
+        ArchiveLayoutScan scan = new ArchiveLayoutScan();
+        if (zipFile == null) return scan;
+
+        Enumeration<? extends ZipEntry> entries = zipFile.entries();
+        while (entries.hasMoreElements()) {
+            ZipEntry entry = entries.nextElement();
+            if (entry == null || entry.isDirectory()) continue;
+
+            String name = FileUtils.safeLower(entry.getName().replace('\\', '/'));
+            if (name.endsWith(".apk")) scan.hasApk = true;
+            if (name.endsWith(".json")) scan.hasJson = true;
+            if (name.endsWith(".obb") || name.startsWith("android/obb/") || name.contains("/android/obb/")) scan.hasObb = true;
+
+            if ("meta.sai_v1.json".equals(name) || "meta.sai_v2.json".equals(name)) {
+                scan.hasSaiMeta = true;
+            }
+            if ("toc.pb".equals(name) || "toc.json".equals(name) || name.startsWith("splits/") || name.startsWith("standalones/")) {
+                scan.hasBundletoolLayout = true;
+            }
+            if ("info.json".equals(name) || "apkm_installer.url".equals(name)) {
+                scan.hasApkmLayout = true;
+            }
+            if ("manifest.json".equals(name) || name.startsWith("android/obb/") || name.contains("/android/obb/")) {
+                scan.hasXapkLayout = true;
+            }
+        }
+
+        if (scan.hasObb) scan.hasXapkLayout = true;
+        return scan;
     }
 
     private static ZipEntry findEntryByExactName(ZipFile zipFile, String exactName) {
@@ -338,7 +406,7 @@ public final class ArchiveUtils {
                     if (parent != null && !parent.exists()) parent.mkdirs();
                     try (InputStream is = new BufferedInputStream(zf.getInputStream(entry));
                          java.io.OutputStream os = new BufferedOutputStream(new FileOutputStream(outFile))) {
-                        byte[] buffer = new byte[8192];
+                        byte[] buffer = new byte[64 * 1024];
                         int len;
                         while ((len = is.read(buffer)) > 0) os.write(buffer, 0, len);
                     }
@@ -372,7 +440,63 @@ public final class ArchiveUtils {
 
                 try (InputStream is = new BufferedInputStream(zf.getInputStream(entry));
                      java.io.OutputStream os = new BufferedOutputStream(new FileOutputStream(outFile))) {
-                    byte[] buffer = new byte[8192];
+                    byte[] buffer = new byte[64 * 1024];
+                    int len;
+                    while ((len = is.read(buffer)) > 0) os.write(buffer, 0, len);
+                }
+            }
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    public static boolean safeUnzipRelevant(File zipFile, File targetDir, ArchiveKind kind) {
+        return safeUnzipRelevant(zipFile, targetDir, kind, kind == ArchiveKind.XAPK || kind == ArchiveKind.ZIP_UNKNOWN);
+    }
+
+    public static boolean safeUnzipRelevant(File zipFile, File targetDir, ArchiveKind kind, boolean keepObb) {
+        if (zipFile == null || targetDir == null || !zipFile.exists()) return false;
+        try (ZipFile zf = new ZipFile(zipFile)) {
+            String targetCanonical = targetDir.getCanonicalPath() + File.separator;
+            Enumeration<? extends ZipEntry> entries = zf.entries();
+            while (entries.hasMoreElements()) {
+                ZipEntry entry = entries.nextElement();
+                if (entry == null || entry.isDirectory()) continue;
+
+                String normalizedName = FileUtils.safeLower(entry.getName().replace('\\', '/'));
+                if (normalizedName.endsWith(".apks") || normalizedName.endsWith(".apkm") || normalizedName.endsWith(".xapk")) continue;
+                if (normalizedName.startsWith("meta-inf/")) {
+                    if (!normalizedName.endsWith(".json") && !normalizedName.endsWith(".apk")) continue;
+                }
+
+                boolean keep = normalizedName.endsWith(".apk")
+                        || normalizedName.endsWith(".json")
+                        || "toc.pb".equals(normalizedName)
+                        || "toc.json".equals(normalizedName)
+                        || "info.json".equals(normalizedName)
+                        || "manifest.json".equals(normalizedName)
+                        || normalizedName.endsWith("apkm_installer.url")
+                        || normalizedName.endsWith("icon.png")
+                        || normalizedName.equals("meta.sai_v1.json")
+                        || normalizedName.equals("meta.sai_v2.json");
+
+                if (!keep && keepObb) {
+                    keep = normalizedName.startsWith("android/obb/")
+                            || normalizedName.contains("/android/obb/")
+                            || normalizedName.endsWith(".obb");
+                }
+                if (!keep) continue;
+
+                File outFile = new File(targetDir, entry.getName());
+                if (!outFile.getCanonicalPath().startsWith(targetCanonical)) continue;
+
+                File parent = outFile.getParentFile();
+                if (parent != null && !parent.exists()) parent.mkdirs();
+
+                try (InputStream is = new BufferedInputStream(zf.getInputStream(entry));
+                     java.io.OutputStream os = new BufferedOutputStream(new FileOutputStream(outFile))) {
+                    byte[] buffer = new byte[64 * 1024];
                     int len;
                     while ((len = is.read(buffer)) > 0) os.write(buffer, 0, len);
                 }
