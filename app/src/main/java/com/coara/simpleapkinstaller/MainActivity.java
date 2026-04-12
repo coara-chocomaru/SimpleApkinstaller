@@ -16,6 +16,7 @@ import android.graphics.drawable.Drawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.provider.Settings;
 import android.text.TextUtils;
 import android.view.View;
@@ -79,6 +80,7 @@ public class MainActivity extends Activity implements View.OnClickListener {
     private String selectedPackageName = "";
     private String selectedAppLabel = "";
     private ArchiveMetadata archiveMetadata = new ArchiveMetadata();
+    private boolean archiveContainsObb = false;
 
     private AlertDialog installLockDialog;
     private boolean installFlowLocked = false;
@@ -327,6 +329,7 @@ public class MainActivity extends Activity implements View.OnClickListener {
                 }
 
                 isArchiveBundle = false;
+                archiveContainsObb = false;
                 baseApkFile = selectedSourceFile;
                 archiveMetadata = new ArchiveMetadata();
                 selectedPackageName = "";
@@ -378,8 +381,10 @@ public class MainActivity extends Activity implements View.OnClickListener {
 
     private void processArchive(File archiveFile) {
         postStatus("アーカイブを解析中...");
-        archiveKind = ArchiveUtils.detectArchiveKind(archiveFile);
-        archiveMetadata = ArchiveUtils.readArchiveMetadataFromZip(archiveFile);
+        ArchiveUtils.ArchiveInspection inspection = ArchiveUtils.inspectArchive(archiveFile);
+        archiveKind = inspection.kind;
+        archiveMetadata = inspection.metadata != null ? inspection.metadata : new ArchiveMetadata();
+        archiveContainsObb = inspection.containsObb;
 
         extractionDir = new File(getCacheDir(), "bundle_extract_" + System.currentTimeMillis());
         if (!extractionDir.mkdirs() && !extractionDir.exists()) {
@@ -388,12 +393,7 @@ public class MainActivity extends Activity implements View.OnClickListener {
             return;
         }
 
-        boolean unzipOk;
-        if (archiveKind == ArchiveKind.XAPK) {
-            unzipOk = ArchiveUtils.safeUnzipApkOnly(archiveFile, extractionDir);
-        } else {
-            unzipOk = ArchiveUtils.safeUnzip(archiveFile, extractionDir);
-        }
+        boolean unzipOk = ArchiveUtils.safeUnzipRelevant(archiveFile, extractionDir, archiveKind, false);
 
         if (!unzipOk) {
             postStatus("解凍失敗");
@@ -460,10 +460,6 @@ public class MainActivity extends Activity implements View.OnClickListener {
         }
 
         isArchiveBundle = archiveKind != ArchiveKind.APK;
-
-        if (selectedSourceFile != null && selectedSourceFile.exists() && isArchiveBundle) {
-            FileUtils.deleteIfUnderCache(this, selectedSourceFile);
-        }
 
         runOnUiThread(() -> {
             btnSelectSplits.setVisibility(isArchiveBundle ? View.VISIBLE : View.GONE);
@@ -719,7 +715,16 @@ public class MainActivity extends Activity implements View.OnClickListener {
             }
         }
 
+        if (archiveContainsObb && !hasAllFilesAccess()) {
+            showAllFilesAccessDialog();
+            toast("OBB の配置には全ファイルアクセス権が必要です");
+            return;
+        }
+
         btnInstall.setEnabled(false);
+        if (archiveContainsObb) {
+            showInstallLockDialog("しばらく時間がかかります……\nお待ちください");
+        }
         postStatus("署名と整合性を確認中...");
         new Thread(() -> {
             List<File> apksForInstall = prepareApksForInstall(filesToInstall);
@@ -933,11 +938,16 @@ public class MainActivity extends Activity implements View.OnClickListener {
 
         switch (status) {
             case PackageInstaller.STATUS_SUCCESS:
-                dismissInstallLockDialog();
-                postStatus("インストール成功！");
-                toast("アプリが正常にインストールされました");
-                resetUIAfterInstall();
-                cleanupTempFiles();
+                if (archiveContainsObb) {
+                    postStatus("インストール成功、OBB を移動中...");
+                    updateInstallLockDialogMessage("しばらく時間がかかります……\nお待ちください");
+                    new Thread(() -> {
+                        boolean obbMoved = moveObbFilesToPublicStorage();
+                        runOnUiThread(() -> completeSuccessfulInstall(obbMoved));
+                    }).start();
+                } else {
+                    completeSuccessfulInstall(true);
+                }
                 break;
             case PackageInstaller.STATUS_PENDING_USER_ACTION:
                 updateInstallLockDialogMessage("インストール処理進行中……");
@@ -1002,6 +1012,133 @@ public class MainActivity extends Activity implements View.OnClickListener {
         }
     }
 
+    private void completeSuccessfulInstall(boolean obbMoved) {
+        dismissInstallLockDialog();
+        if (archiveContainsObb && !obbMoved) {
+            postStatus("インストール成功（OBB の移動は失敗しました）");
+            toast("インストールは成功しましたが、OBB の配置に失敗しました");
+        } else {
+            postStatus("インストール成功！");
+            toast("アプリが正常にインストールされました");
+        }
+        cleanupTempFiles();
+        resetUIAfterInstall();
+    }
+
+    private boolean moveObbFilesToPublicStorage() {
+        if (!archiveContainsObb) return true;
+        String packageName = !TextUtils.isEmpty(selectedPackageName)
+                ? selectedPackageName
+                : (archiveMetadata != null ? archiveMetadata.packageName : "");
+        if (TextUtils.isEmpty(packageName)) return false;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
+            postStatus("OBB の移動には全ファイルアクセス権が必要です");
+            toast("OBB を配置するには全ファイルアクセス権を許可してください");
+            return false;
+        }
+        if (selectedSourceFile == null || !selectedSourceFile.exists()) return false;
+
+        List<ObbEntry> obbEntries = collectObbEntriesFromArchive(selectedSourceFile);
+        if (obbEntries.isEmpty()) return true;
+
+        File obbRoot = new File(Environment.getExternalStorageDirectory(), "Android/obb/" + packageName);
+        if (!obbRoot.exists() && !obbRoot.mkdirs() && !obbRoot.exists()) {
+            return false;
+        }
+
+        try (java.util.zip.ZipFile zipFile = new java.util.zip.ZipFile(selectedSourceFile)) {
+            for (ObbEntry obbEntry : obbEntries) {
+                if (obbEntry == null || TextUtils.isEmpty(obbEntry.entryName)) continue;
+                java.util.zip.ZipEntry entry = zipFile.getEntry(obbEntry.entryName);
+                if (entry == null || entry.isDirectory()) continue;
+
+                File dst = buildDestinationObbFile(obbEntry.entryName, obbRoot, packageName);
+                if (dst == null) continue;
+                File parent = dst.getParentFile();
+                if (parent != null && !parent.exists() && !parent.mkdirs() && !parent.exists()) {
+                    return false;
+                }
+
+                try (java.io.InputStream is = new java.io.BufferedInputStream(zipFile.getInputStream(entry));
+                     java.io.OutputStream os = new java.io.BufferedOutputStream(new java.io.FileOutputStream(dst))) {
+                    byte[] buffer = new byte[64 * 1024];
+                    int len;
+                    while ((len = is.read(buffer)) > 0) os.write(buffer, 0, len);
+                    os.flush();
+                }
+            }
+        } catch (Exception e) {
+            return false;
+        }
+        return true;
+    }
+
+    private static final class ObbEntry {
+        final String entryName;
+
+        ObbEntry(String entryName) {
+            this.entryName = entryName;
+        }
+    }
+
+    private List<ObbEntry> collectObbEntriesFromArchive(File archiveFile) {
+        List<ObbEntry> out = new ArrayList<>();
+        if (archiveFile == null || !archiveFile.exists()) return out;
+        try (java.util.zip.ZipFile zipFile = new java.util.zip.ZipFile(archiveFile)) {
+            java.util.Enumeration<? extends java.util.zip.ZipEntry> entries = zipFile.entries();
+            while (entries.hasMoreElements()) {
+                java.util.zip.ZipEntry entry = entries.nextElement();
+                if (entry == null || entry.isDirectory()) continue;
+                String normalized = FileUtils.safeLower(entry.getName().replace('\\', '/'));
+                if (normalized.startsWith("android/obb/") || normalized.contains("/android/obb/") || normalized.endsWith(".obb")) {
+                    out.add(new ObbEntry(entry.getName()));
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return out;
+    }
+
+    private File buildDestinationObbFile(String entryName, File obbRoot, String packageName) {
+        if (TextUtils.isEmpty(entryName) || obbRoot == null) return null;
+        try {
+            String rel = entryName.replace('\\', '/');
+            while (rel.startsWith("/")) rel = rel.substring(1);
+            int obbIdx = rel.toLowerCase(Locale.US).indexOf("android/obb/");
+            if (obbIdx >= 0) rel = rel.substring(obbIdx + "android/obb/".length());
+            if (rel.toLowerCase(Locale.US).startsWith(packageName.toLowerCase(Locale.US) + "/")) {
+                rel = rel.substring(packageName.length() + 1);
+            }
+            if (TextUtils.isEmpty(rel)) rel = new File(entryName).getName();
+            return new File(obbRoot, rel);
+        } catch (Exception e) {
+            return new File(obbRoot, new File(entryName).getName());
+        }
+    }
+
+    private List<File> findFilesWithExtension(File root, String extension) {
+        List<File> out = new ArrayList<>();
+        if (root == null || !root.exists() || TextUtils.isEmpty(extension)) return out;
+        String wanted = extension.toLowerCase(Locale.US);
+        collectFilesWithExtension(root, wanted, out);
+        return out;
+    }
+
+    private void collectFilesWithExtension(File file, String extension, List<File> out) {
+        if (file == null || !file.exists() || out == null) return;
+        if (file.isDirectory()) {
+            File[] children = file.listFiles();
+            if (children == null) return;
+            for (File child : children) {
+                collectFilesWithExtension(child, extension, out);
+            }
+            return;
+        }
+        if (FileUtils.safeLower(file.getName()).endsWith(extension)) {
+            out.add(file);
+        }
+    }
+
     private void resetUIAfterInstall() {
         if (btnInstall != null) btnInstall.setEnabled(false);
         if (btnSelectSplits != null) btnSelectSplits.setVisibility(View.GONE);
@@ -1016,6 +1153,7 @@ public class MainActivity extends Activity implements View.OnClickListener {
         selectedPackageName = "";
         selectedAppLabel = "";
         archiveMetadata = new ArchiveMetadata();
+        archiveContainsObb = false;
         isArchiveBundle = false;
 
         filesToInstall.clear();
@@ -1025,8 +1163,11 @@ public class MainActivity extends Activity implements View.OnClickListener {
     }
 
     private void cleanupTempFiles() {
-        FileUtils.deleteIfUnderCache(this, selectedSourceFile);
-        if (extractionDir != null) FileUtils.deleteRecursive(extractionDir);
+        File source = selectedSourceFile;
+        File extract = extractionDir;
+        if (source != null) FileUtils.deleteIfUnderCache(this, source);
+        if (extract != null) FileUtils.deleteRecursive(extract);
+        selectedSourceFile = null;
         extractionDir = null;
     }
 
@@ -1109,10 +1250,41 @@ public class MainActivity extends Activity implements View.OnClickListener {
         });
     }
 
+    private boolean hasAllFilesAccess() {
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager();
+    }
+
     private void ensureStartupGuidance() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !getPackageManager().canRequestPackageInstalls()) {
             showUnknownInstallDialog();
+            return;
         }
+        if (!hasAllFilesAccess()) {
+            showAllFilesAccessDialog();
+        }
+    }
+
+    private void showAllFilesAccessDialog() {
+        if (isFinishing()) return;
+        new AlertDialog.Builder(this)
+                .setTitle("全ファイルアクセスが必要です")
+                .setMessage("OBB を配置するには、全ファイルへのアクセスを許可してください。")
+                .setPositiveButton("設定を開く", (dialog, which) -> {
+                    try {
+                        Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
+                        intent.setData(Uri.parse("package:" + getPackageName()));
+                        startActivity(intent);
+                    } catch (Exception first) {
+                        try {
+                            Intent intent = new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION);
+                            startActivity(intent);
+                        } catch (Exception e) {
+                            toast("設定画面を開けませんでした");
+                        }
+                    }
+                })
+                .setNegativeButton("閉じる", null)
+                .show();
     }
 
     private void showUnknownInstallDialog() {
@@ -1193,11 +1365,10 @@ public class MainActivity extends Activity implements View.OnClickListener {
     @Override
     protected void onDestroy() {
         dismissInstallLockDialog();
-        super.onDestroy();
         try {
             unregisterReceiver(installReceiver);
         } catch (Exception ignored) {
         }
-        cleanupTempFiles();
+        super.onDestroy();
     }
 }
