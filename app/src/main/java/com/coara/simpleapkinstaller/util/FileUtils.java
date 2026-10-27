@@ -1,172 +1,135 @@
 package com.coara.simpleapkinstaller.util;
 
-import android.content.ContentResolver;
 import android.content.Context;
 import android.database.Cursor;
 import android.net.Uri;
 import android.provider.OpenableColumns;
-import android.text.TextUtils;
 
-import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.util.Locale;
 
 public final class FileUtils {
+    public static final int BUFFER_SIZE = 128 * 1024;
+
+    public interface ProgressListener {
+        void onProgress(long done) throws IOException;
+    }
+
     private FileUtils() {}
 
-    public static String getFileName(Context context, Uri uri) {
-        if (context == null || uri == null) return null;
+    public static String displayName(Context context, Uri uri) {
         String scheme = uri.getScheme();
         if ("file".equals(scheme)) {
             String path = uri.getPath();
-            if (path != null) {
-                return new File(path).getName();
-            }
-            return null;
+            return path == null ? null : new File(path).getName();
         }
-        try (Cursor cursor = context.getContentResolver().query(uri, null, null, null, null)) {
+        try (Cursor cursor = context.getContentResolver().query(uri, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
             if (cursor != null && cursor.moveToFirst()) {
-                int nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
-                if (nameIndex >= 0) {
-                    String name = cursor.getString(nameIndex);
-                    if (!TextUtils.isEmpty(name)) return name;
+                int index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                if (index >= 0) {
+                    String name = cursor.getString(index);
+                    if (name != null && !name.trim().isEmpty()) return name;
                 }
             }
-        } catch (Exception ignored) {
+        } catch (RuntimeException ignored) {
         }
-        String lastSegment = uri.getLastPathSegment();
-        if (!TextUtils.isEmpty(lastSegment)) {
-            return lastSegment;
-        }
-        return null;
+        return uri.getLastPathSegment();
     }
 
-    public static String sanitizeFileName(String name) {
-        if (TextUtils.isEmpty(name)) return "selected_file";
-        String n = name.replace('\\', '_').replace('/', '_');
-        n = n.replace(':', '_').replace('*', '_').replace('?', '_');
-        n = n.replace('"', '_').replace('<', '_').replace('>', '_').replace('|', '_');
-        if (TextUtils.isEmpty(n.trim())) return "selected_file";
-        return n;
-    }
-
-    private static final int TRANSFER_BUFFER_SIZE = 64 * 1024;
-
-    public static boolean copyUriToFile(Context context, Uri uri, File dest) {
-        if (context == null || uri == null || dest == null) return false;
-        InputStream is = null;
-        OutputStream os = null;
-        try {
-            ContentResolver resolver = context.getContentResolver();
-            is = resolver.openInputStream(uri);
-            if (is == null) return false;
-
-            File parent = dest.getParentFile();
-            if (parent != null && !parent.exists() && !parent.mkdirs() && !parent.exists()) {
-                return false;
+    public static long querySize(Context context, Uri uri) {
+        if ("file".equals(uri.getScheme())) {
+            String path = uri.getPath();
+            return path == null ? -1L : new File(path).length();
+        }
+        try (Cursor cursor = context.getContentResolver().query(uri, new String[]{OpenableColumns.SIZE}, null, null, null)) {
+            if (cursor != null && cursor.moveToFirst()) {
+                int index = cursor.getColumnIndex(OpenableColumns.SIZE);
+                if (index >= 0 && !cursor.isNull(index)) return cursor.getLong(index);
             }
-
-            os = new BufferedOutputStream(new FileOutputStream(dest));
-            byte[] buffer = new byte[TRANSFER_BUFFER_SIZE];
-            int len;
-            while ((len = is.read(buffer)) > 0) os.write(buffer, 0, len);
-            os.flush();
-            return true;
-        } catch (Exception e) {
-            return false;
-        } finally {
-            try { if (is != null) is.close(); } catch (Exception ignored) {}
-            try { if (os != null) os.close(); } catch (Exception ignored) {}
+        } catch (RuntimeException ignored) {
         }
+        return -1L;
     }
 
-    public static boolean copyFile(File src, File dst) {
-        if (src == null || dst == null || !src.exists()) return false;
-        try {
-            File parent = dst.getParentFile();
-            if (parent != null && !parent.exists() && !parent.mkdirs() && !parent.exists()) {
-                return false;
-            }
-            try (InputStream fis = new BufferedInputStream(new FileInputStream(src));
-                 OutputStream fos = new BufferedOutputStream(new FileOutputStream(dst))) {
-                byte[] buffer = new byte[TRANSFER_BUFFER_SIZE];
-                int len;
-                while ((len = fis.read(buffer)) > 0) fos.write(buffer, 0, len);
-                fos.flush();
-            }
-            return true;
-        } catch (Exception ignored) {
-            return false;
+    public static String sanitize(String name, String fallback) {
+        if (name == null) return fallback;
+        StringBuilder sb = new StringBuilder(name.length());
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            boolean bad = c < 0x20 || c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|';
+            sb.append(bad ? '_' : c);
         }
-    }
-
-    public static boolean moveFile(File src, File dst) {
-        if (src == null || dst == null || !src.exists()) return false;
-        try {
-            File parent = dst.getParentFile();
-            if (parent != null && !parent.exists() && !parent.mkdirs() && !parent.exists()) {
-                return false;
-            }
-            if (dst.exists()) deleteRecursive(dst);
-            if (src.renameTo(dst)) return true;
-            if (copyFile(src, dst)) return src.delete();
-            return false;
-        } catch (Exception ignored) {
-            return false;
+        String out = sb.toString().trim();
+        if (out.isEmpty() || out.equals(".") || out.equals("..")) return fallback;
+        if (out.length() > 120) {
+            int dot = out.lastIndexOf('.');
+            String ext = dot > 0 && out.length() - dot <= 8 ? out.substring(dot) : "";
+            out = out.substring(0, 120 - ext.length()) + ext;
         }
+        return out;
     }
 
-    public static String formatFileSize(long size) {
-        if (size >= 1024L * 1024L * 1024L) {
-            return String.format(Locale.US, "%.1f GB", size / (1024.0 * 1024.0 * 1024.0));
-        } else if (size >= 1024L * 1024L) {
-            return String.format(Locale.US, "%.1f MB", size / (1024.0 * 1024.0));
-        } else if (size >= 1024L) {
-            return String.format(Locale.US, "%.1f KB", size / 1024.0);
-        } else {
-            return size + " B";
-        }
-    }
-
-    public static String safeLower(String s) {
-        return (s == null) ? "" : s.toLowerCase(Locale.US);
-    }
-
-    public static long calcTotalSize(java.util.List<File> list) {
+    public static long copy(InputStream in, OutputStream out, ProgressListener listener) throws IOException {
+        byte[] buffer = new byte[BUFFER_SIZE];
         long total = 0L;
-        if (list == null) return 0L;
-        for (File f : list) if (f != null && f.exists()) total += f.length();
+        int read;
+        while ((read = in.read(buffer)) != -1) {
+            out.write(buffer, 0, read);
+            total += read;
+            if (listener != null) listener.onProgress(total);
+        }
         return total;
     }
 
-    public static void deleteIfUnderCache(Context context, File file) {
-        if (context == null || file == null || !file.exists()) return;
-        try {
-            if (file.getCanonicalPath().startsWith(context.getCacheDir().getCanonicalPath())) {
-                deleteRecursive(file);
+    public static void copyUriToFile(Context context, Uri uri, File dest, ProgressListener listener) throws IOException {
+        try (InputStream in = context.getContentResolver().openInputStream(uri)) {
+            if (in == null) throw new IOException("openInputStream returned null");
+            try (OutputStream out = new FileOutputStream(dest)) {
+                copy(in, out, listener);
             }
-        } catch (Exception ignored) {}
+        } catch (IOException | RuntimeException e) {
+            deleteRecursive(dest);
+            throw e;
+        }
     }
 
     public static boolean deleteRecursive(File file) {
-        if (file == null || !file.exists()) return true;
+        if (file == null) return true;
+        try {
+            File parent = file.getParentFile();
+            if (parent != null) {
+                File resolved = new File(parent.getCanonicalFile(), file.getName());
+                if (!resolved.getCanonicalPath().equals(resolved.getAbsolutePath())) return file.delete();
+            }
+        } catch (IOException ignored) {
+        }
         boolean ok = true;
         if (file.isDirectory()) {
-            File[] list = file.listFiles();
-            if (list != null) {
-                for (File child : list) ok &= deleteRecursive(child);
+            File[] children = file.listFiles();
+            if (children != null) {
+                for (File child : children) ok &= deleteRecursive(child);
             }
         }
+        return (!file.exists() || file.delete()) && ok;
+    }
+
+    public static void clearDirectory(File dir) {
+        if (dir == null) return;
+        File[] children = dir.listFiles();
+        if (children == null) return;
+        for (File child : children) deleteRecursive(child);
+    }
+
+    public static boolean isInside(File parent, File child) {
         try {
-            if (file.exists() && !file.delete()) ok = false;
-        } catch (Exception ignored) {
-            ok = false;
+            String p = parent.getCanonicalPath();
+            String c = child.getCanonicalPath();
+            return c.equals(p) || c.startsWith(p + File.separator);
+        } catch (IOException e) {
+            return false;
         }
-        return ok;
     }
 }
