@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Simple APK Installer</string>
+
+    <string name="action_select">ファイルを選択</string>
+    <string name="action_select_splits">インストール対象のAPKを選択</string>
+    <string name="action_install">インストール</string>
+    <string name="action_open">アプリを開く</string>
+    <string name="action_ok">完了</string>
+    <string name="action_cancel">キャンセル</string>
+    <string name="action_close">閉じる</string>
+    <string name="action_open_settings">設定を開く</string>
+
+    <string name="placeholder_name">ファイルが選択されていません</string>
+    <string name="placeholder_hint">APK / APKS / APKM / XAPK ファイルを選択してください。</string>
+
+    <string name="status_reading">ファイルを読み込み中… %1$d%%</string>
+    <string name="status_analyzing">アーカイブを解析中…</string>
+    <string name="status_extracting">APKを展開中… %1$d%%</string>
+    <string name="status_ready">インストールの準備ができました。</string>
+    <string name="status_checking">署名を確認中…</string>
+    <string name="status_signing">署名中 (%1$d/%2$d): %3$s</string>
+    <string name="status_writing">インストーラーへ転送中… %1$d%%</string>
+    <string name="status_waiting">システムのインストーラーを待機中…</string>
+    <string name="status_obb">OBBを配置中… %1$d%%</string>
+    <string name="status_success">インストールに成功しました。</string>
+    <string name="status_success_obb_failed">インストールは成功しましたが、OBBの配置に失敗しました: %1$s</string>
+    <string name="status_failure">インストール失敗: %1$s</string>
+    <string name="status_cancelled">キャンセルしました。</string>
+
+    <string name="toast_busy">現在の処理が完了するまでお待ちください。</string>
+    <string name="toast_unsupported">対応していないファイルです。</string>
+    <string name="toast_no_selection">APKを1つ以上選択してください。</string>
+    <string name="toast_base_required">Base APKは必須です。</string>
+    <string name="toast_permission_denied">権限が許可されませんでした。</string>
+
+    <string name="error_read">ファイルを読み込めませんでした: %1$s</string>
+    <string name="error_no_space">ストレージの空き容量が不足しています。</string>
+    <string name="error_no_apk">インストール可能なAPKが見つかりません。</string>
+    <string name="error_invalid_apk">APKが壊れているか、対応していません。</string>
+    <string name="error_no_base">Base APKを特定できません。</string>
+    <string name="error_sign">署名に失敗しました: %1$s</string>
+    <string name="error_signer_mismatch">選択したAPK同士の署名が一致しません: %1$s</string>
+    <string name="error_conflict_signature">インストール済みのアプリと署名が異なります。先にアンインストールしてください。</string>
+    <string name="error_downgrade">選択したバージョン (%1$s) はインストール済みのバージョン (%2$s) より古いため中止しました。</string>
+    <string name="error_session">インストールを開始できませんでした: %1$s</string>
+
+    <string name="fail_aborted">インストールが中断されました。</string>
+    <string name="fail_blocked">システムまたはセキュリティ設定によりブロックされました。</string>
+    <string name="fail_conflict">インストール済みのアプリと競合しています（署名またはパッケージの不一致）。</string>
+    <string name="fail_incompatible">この端末と互換性がありません。</string>
+    <string name="fail_invalid">APKファイルが不正です。</string>
+    <string name="fail_storage">ストレージの空き容量が不足しています。</string>
+    <string name="fail_unknown">不明なエラー (%1$d)</string>
+
+    <string name="title_choose_apks">インストールするAPKを選択</string>
+    <string name="tag_base">[BASE]</string>
+    <string name="tag_base_candidate">[BASE候補]</string>
+    <string name="tag_language">[言語]</string>
+    <string name="tag_abi">[ABI]</string>
+    <string name="tag_density">[密度]</string>
+    <string name="tag_feature">[機能]</string>
+
+    <string name="summary_single">%1$s</string>
+    <string name="summary_bundle">%1$s · %3$d個中%2$d個のAPKを選択中</string>
+    <string name="line_version">バージョン %1$s (%2$d)</string>
+    <string name="line_update">更新: %1$s → %2$s</string>
+    <string name="line_new">新規インストール</string>
+
+    <string name="permission_install_title">許可が必要です</string>
+    <string name="permission_install_message">システム設定で、このアプリに「不明なアプリのインストール」を許可してください。</string>
+    <string name="permission_files_title">全ファイルアクセスが必要です</string>
+    <string name="permission_files_message">OBBを配置するには全ファイルへのアクセスが必要です。システム設定で許可してください。</string>
+    <string name="error_settings">設定画面を開けませんでした。</string>
+</resources>
