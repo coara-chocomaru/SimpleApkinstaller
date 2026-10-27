@@ -1,26 +1,24 @@
-plugins { 
+plugins {
     id 'com.android.application'
 }
 
 android {
-    compileSdk = 36
     namespace = 'com.coara.simpleapkinstaller'
+    compileSdk = 36
 
     defaultConfig {
+        applicationId = 'com.coara.simpleapkinstaller'
         minSdk = 24
-        targetSdk = 33
-        versionCode = 13
-        versionName = "1.6"
-        multiDexEnabled = true
-        vectorDrawables.useSupportLibrary = true
-        proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        targetSdk = 35
+        versionCode = 14
+        versionName = "2.0"
     }
 
     compileOptions {
-        sourceCompatibility JavaVersion.VERSION_21
-        targetCompatibility JavaVersion.VERSION_21
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
     }
-    
+
     signingConfigs {
         release {
             storeFile file('test.jks')
@@ -37,23 +35,23 @@ android {
         release {
             minifyEnabled = true
             shrinkResources = true
-            debuggable = false
             signingConfig = signingConfigs.release
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
 
-    lint {
-        disable += ['ExpiredTargetSdkVersion', 'NewApi', 'Range', 'SetTextI18n', 'ScopedStorage', 'FieldCanBeLocal', 'GradleDependency']
+    dependenciesInfo {
+        includeInApk = false
+        includeInBundle = false
     }
-    packagingOptions {
-        excludes += "DebugProbesKt.bin"
+
+    lint {
+        abortOnError = false
+        disable += ['QueryAllPackagesPermission', 'ScopedStorage']
     }
 }
 
 tasks.withType(JavaCompile).configureEach {
-    options.compilerArgs += ["-Xlint:deprecation", "-Xlint:unchecked"]
-}
-
-dependencies {
-    implementation 'com.android.tools.build:apksig:9.1.0'
+    options.encoding = 'UTF-8'
+    options.compilerArgs += ['-Xlint:deprecation', '-Xlint:unchecked']
 }
