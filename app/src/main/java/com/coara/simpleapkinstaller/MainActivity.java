@@ -6,10 +6,14 @@ import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.content.pm.PackageInstaller;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.SystemClock;
 import android.provider.Settings;
 import android.text.format.Formatter;
 import android.view.View;
@@ -61,6 +65,9 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
     private ProgressBar progress;
 
     private ExecutorService worker;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private PackageInstaller packageInstaller;
+    private boolean packageInstallerCallbackRegistered;
     private CancelToken token = new CancelToken();
     private File jobDir;
     private BundleLoader.Loaded loaded;
@@ -68,11 +75,50 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
 
     private volatile boolean busy;
     private volatile boolean awaitingResult;
+    private boolean activityStarted;
+    private volatile boolean commitStarted;
+    private volatile int sessionId = -1;
+    private volatile long installStartedAt;
+    private volatile long lastInstallerProgressAt;
+    private volatile boolean installerActive;
+    private volatile boolean installerActivityKnown;
+    private volatile boolean awaitingUserAction;
+    private volatile boolean userConfirmedInstall;
     private boolean obbRunning;
     private boolean installed;
     private boolean installPromptShown;
-    private int sessionId = -1;
+    private int lastInstallerPercent = -1;
     private Object lastReportKey;
+
+    private final PackageInstaller.SessionCallback installerSessionCallback = new PackageInstaller.SessionCallback() {
+        @Override
+        public void onCreated(int sessionId) {}
+
+        @Override
+        public void onBadgingChanged(int sessionId) {}
+
+        @Override
+        public void onActiveChanged(int changedSessionId, boolean active) {
+            updateInstallerActivity(changedSessionId, active);
+        }
+
+        @Override
+        public void onProgressChanged(int sessionId, float value) {
+            updateInstallerProgress(sessionId, value);
+        }
+
+        @Override
+        public void onFinished(int sessionId, boolean success) {}
+    };
+
+    private final Runnable installWaitTicker = new Runnable() {
+        @Override
+        public void run() {
+            if (!activityStarted || !awaitingResult || !commitStarted || isFinishing() || isDestroyed()) return;
+            updateInstallWaitStatus();
+            mainHandler.postDelayed(this, 1000L);
+        }
+    };
 
     private BackGuard backGuard;
 
@@ -173,12 +219,21 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
     @Override
     protected void onStart() {
         super.onStart();
+        activityStarted = true;
+        registerInstallerSessionCallback();
         InstallEvents.attach(this);
+        if (awaitingResult && commitStarted) {
+            refreshInstallerProgress();
+            startInstallWaitTicker();
+        }
     }
 
     @Override
     protected void onStop() {
+        activityStarted = false;
         InstallEvents.detach(this);
+        mainHandler.removeCallbacks(installWaitTicker);
+        if (!awaitingResult) unregisterInstallerSessionCallback();
         super.onStop();
     }
 
@@ -191,6 +246,8 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
 
     @Override
     protected void onDestroy() {
+        mainHandler.removeCallbacks(installWaitTicker);
+        unregisterInstallerSessionCallback();
         token.cancel();
         worker.shutdownNow();
         setBackBlocked(false);
@@ -635,6 +692,15 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
         final CancelToken currentToken = token;
         lastReportKey = null;
         sessionId = -1;
+        commitStarted = false;
+        installStartedAt = 0L;
+        lastInstallerPercent = -1;
+        lastInstallerProgressAt = 0L;
+        installerActive = false;
+        installerActivityKnown = false;
+        awaitingUserAction = false;
+        userConfirmedInstall = false;
+        mainHandler.removeCallbacks(installWaitTicker);
         InstallEvents.discardPending();
         setBusy(true);
         awaitingResult = true;
@@ -646,19 +712,37 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
                 reporter.progress(0);
                 reporter.status(R.string.status_writing, 0);
                 final int[] last = {-1};
-                int id = ApkInstaller.commit(getApplicationContext(), prepared.files, prepared.base, prepared.packageName, percent -> {
-                    currentToken.check();
-                    if (percent != last[0]) {
-                        last[0] = percent;
-                        reporter.status(R.string.status_writing, percent);
-                        reporter.progress(percent);
+                int id = ApkInstaller.commit(getApplicationContext(), prepared.files, prepared.base, prepared.packageName, new ApkInstaller.Progress() {
+                    @Override
+                    public void onProgress(int percent) throws IOException {
+                        currentToken.check();
+                        if (percent != last[0]) {
+                            last[0] = percent;
+                            reporter.status(R.string.status_writing, percent);
+                            reporter.progress(percent);
+                        }
+                    }
+
+                    @Override
+                    public void onSessionCreated(int createdSessionId) {
+                        sessionId = createdSessionId;
+                    }
+
+                    @Override
+                    public void onCommitStarted() {
+                        installStartedAt = SystemClock.elapsedRealtime();
+                        commitStarted = true;
+                        ui(() -> {
+                            if (!activityStarted || !awaitingResult) return;
+                            startInstallWaitTicker();
+                        });
                     }
                 });
                 ui(() -> {
                     sessionId = id;
                     if (!awaitingResult) return;
-                    reporter.progress(-1);
-                    tvStatus.setText(R.string.status_waiting);
+                    updateInstallWaitStatus();
+                    startInstallWaitTicker();
                 });
             } catch (UserException e) {
                 ui(() -> onInstallFailed(getString(R.string.status_failure, getString(e.resId, e.args))));
@@ -681,6 +765,13 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
 
         switch (event.status) {
             case android.content.pm.PackageInstaller.STATUS_PENDING_USER_ACTION:
+                awaitingUserAction = true;
+                userConfirmedInstall = false;
+                installerActive = false;
+                installerActivityKnown = true;
+                lastInstallerPercent = -1;
+                lastInstallerProgressAt = 0L;
+                progress.setIndeterminate(true);
                 tvStatus.setText(R.string.status_waiting);
                 if (event.confirmIntent != null) {
                     try {
@@ -697,6 +788,129 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
             default:
                 onInstallFailed(getString(R.string.status_failure, failureText(event.status, event.message)));
                 break;
+        }
+    }
+
+    private void registerInstallerSessionCallback() {
+        if (packageInstallerCallbackRegistered) return;
+        try {
+            packageInstaller = getPackageManager().getPackageInstaller();
+            packageInstaller.registerSessionCallback(installerSessionCallback, mainHandler);
+            packageInstallerCallbackRegistered = true;
+        } catch (RuntimeException ignored) {
+            packageInstallerCallbackRegistered = false;
+        }
+    }
+
+    private void unregisterInstallerSessionCallback() {
+        if (!packageInstallerCallbackRegistered || packageInstaller == null) return;
+        try {
+            packageInstaller.unregisterSessionCallback(installerSessionCallback);
+        } catch (RuntimeException ignored) {
+        }
+        packageInstallerCallbackRegistered = false;
+    }
+
+    private void refreshInstallerProgress() {
+        if (sessionId < 0 || !commitStarted || !awaitingResult) return;
+        try {
+            if (packageInstaller == null) packageInstaller = getPackageManager().getPackageInstaller();
+            PackageInstaller.SessionInfo info = packageInstaller.getSessionInfo(sessionId);
+            if (info == null) return;
+            installerActive = info.isActive();
+            installerActivityKnown = true;
+            if (awaitingUserAction && installerActive) {
+                awaitingUserAction = false;
+                userConfirmedInstall = true;
+                lastInstallerPercent = -1;
+                lastInstallerProgressAt = 0L;
+            } else if (installerActive) {
+                userConfirmedInstall = true;
+            }
+            if (!awaitingUserAction && installerActive) {
+                updateInstallerProgress(sessionId, info.getProgress());
+            } else {
+                updateInstallWaitStatus();
+            }
+        } catch (RuntimeException ignored) {
+        }
+    }
+
+    private void updateInstallerActivity(int changedSessionId, boolean active) {
+        if (!awaitingResult || !commitStarted || changedSessionId != sessionId) return;
+        boolean currentActive = active;
+        try {
+            if (packageInstaller == null) packageInstaller = getPackageManager().getPackageInstaller();
+            PackageInstaller.SessionInfo info = packageInstaller.getSessionInfo(changedSessionId);
+            if (info != null) currentActive = info.isActive();
+        } catch (RuntimeException ignored) {
+        }
+        installerActive = currentActive;
+        installerActivityKnown = true;
+        if (awaitingUserAction && currentActive) {
+            awaitingUserAction = false;
+            userConfirmedInstall = true;
+            lastInstallerPercent = -1;
+            lastInstallerProgressAt = 0L;
+        } else if (currentActive) {
+            userConfirmedInstall = true;
+        }
+        if (activityStarted) updateInstallWaitStatus();
+    }
+
+    private void updateInstallerProgress(int changedSessionId, float value) {
+        if (!awaitingResult || !commitStarted || changedSessionId != sessionId || Float.isNaN(value) || Float.isInfinite(value)) return;
+        if (awaitingUserAction) {
+            boolean activeNow = false;
+            try {
+                if (packageInstaller == null) packageInstaller = getPackageManager().getPackageInstaller();
+                PackageInstaller.SessionInfo info = packageInstaller.getSessionInfo(changedSessionId);
+                activeNow = info != null && info.isActive();
+            } catch (RuntimeException ignored) {
+            }
+            if (!activeNow) return;
+            awaitingUserAction = false;
+            userConfirmedInstall = true;
+            installerActive = true;
+            installerActivityKnown = true;
+            lastInstallerPercent = -1;
+            lastInstallerProgressAt = 0L;
+        } else {
+            userConfirmedInstall = true;
+        }
+        final int reportedPercent = Math.max(0, Math.min(99, Math.round(value * 100f)));
+        if (lastInstallerPercent >= 0 && reportedPercent < lastInstallerPercent) return;
+        lastInstallerPercent = reportedPercent;
+        lastInstallerProgressAt = SystemClock.elapsedRealtime();
+        if (activityStarted) updateInstallWaitStatus();
+    }
+
+    private void startInstallWaitTicker() {
+        mainHandler.removeCallbacks(installWaitTicker);
+        if (!activityStarted || !awaitingResult || !commitStarted) return;
+        updateInstallWaitStatus();
+        mainHandler.postDelayed(installWaitTicker, 1000L);
+    }
+
+    private void updateInstallWaitStatus() {
+        if (!activityStarted || !awaitingResult || !commitStarted) return;
+        long now = SystemClock.elapsedRealtime();
+        long elapsed = installStartedAt > 0L ? Math.max(0L, (now - installStartedAt) / 1000L) : 0L;
+        boolean progressFresh = lastInstallerPercent >= 0 && lastInstallerProgressAt > 0L && now - lastInstallerProgressAt < 3000L;
+        if (awaitingUserAction || (!userConfirmedInstall && installerActivityKnown && !installerActive)) {
+            progress.setIndeterminate(true);
+            tvStatus.setText(getString(R.string.status_waiting_elapsed, elapsed));
+        } else if (progressFresh) {
+            progress.setIndeterminate(false);
+            progress.setProgress(lastInstallerPercent);
+            tvStatus.setText(getString(R.string.status_install_progress, lastInstallerPercent, elapsed));
+        } else {
+            progress.setIndeterminate(true);
+            if (lastInstallerPercent >= 0) {
+                tvStatus.setText(getString(R.string.status_install_progress_stale, lastInstallerPercent, elapsed));
+            } else {
+                tvStatus.setText(getString(R.string.status_installing_elapsed, elapsed));
+            }
         }
     }
 
@@ -731,6 +945,11 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
 
     private void onInstallFailed(String text) {
         awaitingResult = false;
+        commitStarted = false;
+        awaitingUserAction = false;
+        userConfirmedInstall = false;
+        mainHandler.removeCallbacks(installWaitTicker);
+        unregisterInstallerSessionCallback();
         setBackBlocked(false);
         setBusy(false);
         tvStatus.setText(text);
@@ -738,6 +957,11 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
 
     private void onInstallSucceeded() {
         awaitingResult = false;
+        commitStarted = false;
+        awaitingUserAction = false;
+        userConfirmedInstall = false;
+        mainHandler.removeCallbacks(installWaitTicker);
+        unregisterInstallerSessionCallback();
         final BundleLoader.Loaded l = loaded;
         if (l == null || !l.hasObb) {
             finishSuccess(null);
