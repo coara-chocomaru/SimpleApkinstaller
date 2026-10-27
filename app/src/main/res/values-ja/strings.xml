@@ -22,6 +22,10 @@
     <string name="status_signing">署名中 (%1$d/%2$d): %3$s</string>
     <string name="status_writing">インストーラーへ転送中… %1$d%%</string>
     <string name="status_waiting">システムのインストーラーを待機中…</string>
+    <string name="status_waiting_elapsed">システムインストーラーの応答を待機中… %1$d秒経過</string>
+    <string name="status_installing_elapsed">システム側でインストール処理中… %1$d秒経過</string>
+    <string name="status_install_progress">システム側のインストール進捗：%1$d%%（%2$d秒経過）</string>
+    <string name="status_install_progress_stale">システム側でインストール処理中… 直近の進捗 %1$d%%（%2$d秒経過）</string>
     <string name="status_obb">OBBを配置中… %1$d%%</string>
     <string name="status_success">インストールに成功しました。</string>
     <string name="status_success_obb_failed">インストールは成功しましたが、OBBの配置に失敗しました: %1$s</string>
