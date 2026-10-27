@@ -18,6 +18,10 @@ import java.util.List;
 public final class ApkInstaller {
     public interface Progress {
         void onProgress(int percent) throws IOException;
+
+        default void onSessionCreated(int sessionId) {}
+
+        default void onCommitStarted() {}
     }
 
     private ApkInstaller() {}
@@ -39,6 +43,7 @@ public final class ApkInstaller {
         }
 
         int sessionId = installer.createSession(params);
+        progress.onSessionCreated(sessionId);
         PackageInstaller.Session session = null;
         try {
             session = installer.openSession(sessionId);
@@ -68,6 +73,7 @@ public final class ApkInstaller {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) flags |= PendingIntent.FLAG_MUTABLE;
             PendingIntent pending = PendingIntent.getBroadcast(context, sessionId, callback, flags);
 
+            progress.onCommitStarted();
             session.commit(pending.getIntentSender());
             return sessionId;
         } catch (IOException | RuntimeException e) {
