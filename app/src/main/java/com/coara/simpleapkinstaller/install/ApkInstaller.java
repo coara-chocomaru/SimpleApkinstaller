@@ -18,9 +18,7 @@ import java.util.List;
 public final class ApkInstaller {
     public interface Progress {
         void onProgress(int percent) throws IOException;
-
         default void onSessionCreated(int sessionId) {}
-
         default void onCommitStarted() {}
     }
 
@@ -73,8 +71,10 @@ public final class ApkInstaller {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) flags |= PendingIntent.FLAG_MUTABLE;
             PendingIntent pending = PendingIntent.getBroadcast(context, sessionId, callback, flags);
 
-            progress.onCommitStarted();
             session.commit(pending.getIntentSender());
+            session.close();
+            session = null;
+            progress.onCommitStarted();
             return sessionId;
         } catch (IOException | RuntimeException e) {
             if (session != null) {
