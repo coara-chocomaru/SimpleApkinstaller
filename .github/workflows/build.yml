@@ -1,14 +1,20 @@
 name: Build
+
 on:
   push:
     branches:
-      - main
+      - main2
   pull_request:
-  
     branches:
-      - main
+      - main2
+  workflow_dispatch:
+
 permissions:
   contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -22,40 +28,31 @@ jobs:
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
+          distribution: temurin
           java-version: 21
-          
-      - name: chmod +x
-        run: chmod +x ./gradlew
-        
+
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
       - name: Set variables
         run: |
+          version="v$(grep -m1 versionName app/build.gradle | awk -F'"' '{print $2}')"
+          commit="$(echo "${GITHUB_SHA}" | cut -c-7)"
+          repo="${GITHUB_REPOSITORY#${GITHUB_REPOSITORY_OWNER}/}"
+          timestamp="$(TZ='Asia/Tokyo' date +'%Y%m%d%H%M%S')"
           {
-            echo "version=v$(grep versionName app/build.gradle | awk -F\" '{print $2}')"
-            echo "commit=$(echo ${{ github.sha }} | cut -c-7)"
-            echo "repo=$(echo ${GITHUB_REPOSITORY#$GITHUB_REPOSITORY_OWNER/})"
-            echo "timestamp=$(TZ='Asia/Tokyo' date +'%Y%m%d%H%M%S')"
             echo "name=${repo}-${version}-${commit}-${timestamp}"
-          } >> $GITHUB_ENV
-
-      - name: Show set variables
-        run: |
-          echo "name=${{ env.repo }}-${{ env.version }}-${{ env.commit }}-${{ env.timestamp }}" >> $GITHUB_ENV
-          echo -e "version=${{ env.version }}"
-          echo -e "commit=${{ env.commit }}"
-          echo -e "repo=${{ env.repo }}"
-          echo -e "timestamp=${{ env.timestamp }}"
+          } >> "$GITHUB_ENV"
 
       - name: Build
         run: |
+          chmod +x ./gradlew
           ./gradlew --no-daemon --stacktrace --warning-mode=all assembleRelease
           mv -vf app/build/outputs/apk/release/app-release.apk "${{ env.name }}.apk"
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: "${{ env.name }}"
-          path: "${{ env.name }}.apk"
+          name: ${{ env.name }}
+          path: ${{ env.name }}.apk
+          if-no-files-found: error
