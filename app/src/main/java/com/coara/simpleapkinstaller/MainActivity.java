@@ -1,99 +1,105 @@
 package com.coara.simpleapkinstaller;
 
+import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
-import android.app.PendingIntent;
-import android.content.BroadcastReceiver;
-import android.content.Context;
+import android.content.ActivityNotFoundException;
 import android.content.Intent;
-import android.content.IntentFilter;
-import android.content.SharedPreferences;
-import android.content.pm.ApplicationInfo;
-import android.content.pm.PackageInfo;
-import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
-import android.graphics.drawable.Drawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.provider.Settings;
-import android.text.TextUtils;
+import android.text.format.Formatter;
 import android.view.View;
-import android.view.KeyEvent;
-import android.view.WindowManager;
+import android.view.WindowInsets;
 import android.widget.Button;
 import android.widget.ImageView;
+import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import com.coara.simpleapkinstaller.model.ArchiveKind;
-import com.coara.simpleapkinstaller.model.ArchiveMetadata;
-import com.coara.simpleapkinstaller.util.ApkSignatureUtils;
-import com.coara.simpleapkinstaller.util.ArchiveUtils;
+import com.coara.simpleapkinstaller.install.ApkInstaller;
+import com.coara.simpleapkinstaller.install.InstallEvents;
+import com.coara.simpleapkinstaller.install.InstallPipeline;
+import com.coara.simpleapkinstaller.model.ApkEntry;
+import com.coara.simpleapkinstaller.util.BackGuard;
+import com.coara.simpleapkinstaller.util.BundleLoader;
+import com.coara.simpleapkinstaller.util.CancelToken;
 import com.coara.simpleapkinstaller.util.FileUtils;
+import com.coara.simpleapkinstaller.util.ObbInstaller;
+import com.coara.simpleapkinstaller.util.Reporter;
+import com.coara.simpleapkinstaller.util.SplitSelector;
+import com.coara.simpleapkinstaller.util.UserException;
 
 import java.io.File;
-import java.io.FileInputStream;
-import java.io.OutputStream;
-import java.util.ArrayList;
-import java.util.Collections;
+import java.io.IOException;
+import java.io.InterruptedIOException;
+import java.util.Arrays;
 import java.util.List;
-import java.util.Locale;
-import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
-public class MainActivity extends Activity implements View.OnClickListener {
+public class MainActivity extends Activity implements View.OnClickListener, InstallEvents.Listener {
+    private static final int REQUEST_PICK = 101;
+    private static final int REQUEST_STORAGE_READ = 102;
+    private static final int REQUEST_STORAGE_WRITE = 103;
+    private static final String JOB_PREFIX = "job_";
 
-    private static final int REQUEST_CODE_FILE_PICKER = 101;
-    private static final String ACTION_INSTALL_COMPLETE = "com.coara.simpleapkinstaller.INSTALL_COMPLETE";
-
-    private static final String KEY_SELECTED_SOURCE_FILE = "selectedSourceFile";
-    private static final String KEY_EXTRACTION_DIR = "extractionDir";
-    private static final String KEY_BASE_APK_FILE = "baseApkFile";
-    private static final String KEY_SELECTED_PACKAGE_NAME = "selectedPackageName";
-    private static final String KEY_SELECTED_APP_LABEL = "selectedAppLabel";
-    private static final String KEY_IS_ARCHIVE_BUNDLE = "isArchiveBundle";
-    private static final String KEY_ARCHIVE_KIND = "archiveKind";
-    private static final String KEY_ALL_AVAILABLE_APKS = "allAvailableApks";
-    private static final String KEY_SELECTED_APK_STATES = "selectedApkStates";
-    private static final String KEY_SELECTED_BASE_APK_FILE = "selectedBaseApkFile";
-
+    private View root;
     private Button btnSelect;
-    private Button btnInstall;
     private Button btnSelectSplits;
+    private Button btnInstall;
+    private Button btnOpen;
     private ImageView ivIcon;
-    private TextView tvFileName;
+    private TextView tvName;
+    private TextView tvPackage;
+    private TextView tvVersion;
     private TextView tvSize;
     private TextView tvStatus;
+    private ProgressBar progress;
 
-    private File selectedSourceFile;
-    private File extractionDir;
-    private File baseApkFile;
+    private ExecutorService worker;
+    private CancelToken token = new CancelToken();
+    private File jobDir;
+    private BundleLoader.Loaded loaded;
+    private Uri pendingReadUri;
 
-    private final List<File> filesToInstall = new ArrayList<>();
-    private final List<File> allAvailableApks = new ArrayList<>();
-    private final List<File> baseApkCandidates = new ArrayList<>();
-    private boolean[] selectedApkStates;
-    private boolean isArchiveBundle = false;
-    private ArchiveKind archiveKind = ArchiveKind.APK;
+    private volatile boolean busy;
+    private volatile boolean awaitingResult;
+    private boolean obbRunning;
+    private boolean installed;
+    private boolean installPromptShown;
+    private int sessionId = -1;
+    private Object lastReportKey;
 
-    private String selectedPackageName = "";
-    private String selectedAppLabel = "";
-    private ArchiveMetadata archiveMetadata = new ArchiveMetadata();
-    private boolean archiveContainsObb = false;
+    private BackGuard backGuard;
 
-    private AlertDialog installLockDialog;
-    private boolean installFlowLocked = false;
-    private String installLockMessage = "インストール中……";
-
-    private SharedPreferences prefs;
-
-    private final BroadcastReceiver installReceiver = new BroadcastReceiver() {
+    private final Reporter reporter = new Reporter() {
         @Override
-        public void onReceive(Context context, Intent intent) {
-            if (intent != null && ACTION_INSTALL_COMPLETE.equals(intent.getAction())) {
-                handleInstallResult(intent);
+        public void status(int resId, Object... args) {
+            Object[] key = new Object[args.length + 1];
+            key[0] = resId;
+            System.arraycopy(args, 0, key, 1, args.length);
+            Object snapshot = Arrays.asList(key);
+            synchronized (MainActivity.this) {
+                if (snapshot.equals(lastReportKey)) return;
+                lastReportKey = snapshot;
             }
+            ui(() -> tvStatus.setText(getString(resId, args)));
+        }
+
+        @Override
+        public void progress(int percent) {
+            ui(() -> {
+                if (percent < 0) {
+                    progress.setIndeterminate(true);
+                } else {
+                    progress.setIndeterminate(false);
+                    progress.setProgress(percent);
+                }
+            });
         }
     };
 
@@ -102,164 +108,78 @@ public class MainActivity extends Activity implements View.OnClickListener {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
 
+        root = findViewById(R.id.root);
         btnSelect = findViewById(R.id.btn_select);
-        btnInstall = findViewById(R.id.btn_install);
         btnSelectSplits = findViewById(R.id.btn_select_splits);
+        btnInstall = findViewById(R.id.btn_install);
+        btnOpen = findViewById(R.id.btn_open);
         ivIcon = findViewById(R.id.iv_icon);
-        tvFileName = findViewById(R.id.tv_file_name);
+        tvName = findViewById(R.id.tv_file_name);
+        tvPackage = findViewById(R.id.tv_package);
+        tvVersion = findViewById(R.id.tv_version);
         tvSize = findViewById(R.id.tv_size);
         tvStatus = findViewById(R.id.tv_status);
+        progress = findViewById(R.id.progress);
 
         btnSelect.setOnClickListener(this);
-        btnInstall.setOnClickListener(this);
         btnSelectSplits.setOnClickListener(this);
+        btnInstall.setOnClickListener(this);
+        btnOpen.setOnClickListener(this);
 
-        prefs = getSharedPreferences("device_config", Context.MODE_PRIVATE);
-        detectArchIfNeeded();
-        cleanupOldCacheFiles();
+        root.setOnApplyWindowInsetsListener((view, insets) -> {
+            applyInsets(view, insets);
+            return insets;
+        });
 
-        if (savedInstanceState != null) {
-            restoreInstanceState(savedInstanceState);
+        worker = Executors.newSingleThreadExecutor();
+
+        if (savedInstanceState == null) {
+            clearStaleJobs();
+            requestInstallPermissionIfNeeded();
+            handleIntent(getIntent());
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    private void applyInsets(View view, WindowInsets insets) {
+        int left;
+        int top;
+        int right;
+        int bottom;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            android.graphics.Insets bars = insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
+            left = bars.left;
+            top = bars.top;
+            right = bars.right;
+            bottom = bars.bottom;
         } else {
-            resetUIAfterInstall();
+            left = insets.getSystemWindowInsetLeft();
+            top = insets.getSystemWindowInsetTop();
+            right = insets.getSystemWindowInsetRight();
+            bottom = insets.getSystemWindowInsetBottom();
         }
-
-        IntentFilter filter = new IntentFilter(ACTION_INSTALL_COMPLETE);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(installReceiver, filter, Context.RECEIVER_EXPORTED);
-        } else {
-            registerReceiver(installReceiver, filter);
-        }
-
-        ensureStartupGuidance();
-        handleIntent(getIntent());
+        view.setPadding(left, top, right, bottom);
     }
 
-    private void detectArchIfNeeded() {
-        if (!prefs.contains("device_arch")) {
-            String arch = detectPrimaryArch();
-            prefs.edit().putString("device_arch", arch).apply();
-        }
-    }
-
-    private String detectPrimaryArch() {
-        String[] abi64 = Build.SUPPORTED_64_BIT_ABIS;
-        if (abi64 != null) {
-            for (String abi : abi64) {
-                if (abi == null) continue;
-                String lower = abi.toLowerCase(Locale.US);
-                if (lower.contains("arm64") || lower.contains("aarch64")) return "arm64";
-                if (lower.contains("x86_64")) return "x86_64";
-            }
-        }
-
-        String[] abi32 = Build.SUPPORTED_32_BIT_ABIS;
-        if (abi32 != null) {
-            for (String abi : abi32) {
-                if (abi == null) continue;
-                String lower = abi.toLowerCase(Locale.US);
-                if (lower.contains("armeabi") || lower.contains("armv7") || lower.contains("arm")) return "arm";
-                if (lower.contains("x86")) return "x86";
-            }
-        }
-
-        String[] abis = Build.SUPPORTED_ABIS;
-        if (abis != null && abis.length > 0) {
-            String primary = abis[0].toLowerCase(Locale.US);
-            if (primary.contains("arm64") || primary.contains("aarch64")) return "arm64";
-            if (primary.contains("armeabi") || primary.contains("armv7") || primary.contains("arm")) return "arm";
-            if (primary.contains("x86_64")) return "x86_64";
-            if (primary.contains("x86")) return "x86";
-        }
-        return "arm";
-    }
-
-    private void cleanupOldCacheFiles() {
-        File cacheDir = getCacheDir();
-        if (cacheDir == null || !cacheDir.exists()) return;
-        File[] files = cacheDir.listFiles();
-        if (files == null) return;
-        for (File f : files) {
-            if (f == null || !f.exists()) continue;
-            if ((extractionDir != null && f.equals(extractionDir)) ||
-                (selectedSourceFile != null && f.equals(selectedSourceFile))) {
-                continue;
-            }
-            FileUtils.deleteRecursive(f);
+    private void clearStaleJobs() {
+        File cache = getCacheDir();
+        File[] children = cache.listFiles();
+        if (children == null) return;
+        for (File child : children) {
+            if (child.getName().startsWith(JOB_PREFIX)) FileUtils.deleteRecursive(child);
         }
     }
 
     @Override
-    protected void onSaveInstanceState(Bundle outState) {
-        super.onSaveInstanceState(outState);
-
-        if (selectedSourceFile != null && selectedSourceFile.exists()) {
-            outState.putString(KEY_SELECTED_SOURCE_FILE, selectedSourceFile.getAbsolutePath());
-        }
-        if (extractionDir != null && extractionDir.exists()) {
-            outState.putString(KEY_EXTRACTION_DIR, extractionDir.getAbsolutePath());
-        }
-        if (baseApkFile != null && baseApkFile.exists()) {
-            outState.putString(KEY_BASE_APK_FILE, baseApkFile.getAbsolutePath());
-        }
-
-        outState.putString(KEY_SELECTED_PACKAGE_NAME, selectedPackageName);
-        outState.putString(KEY_SELECTED_APP_LABEL, selectedAppLabel);
-        outState.putBoolean(KEY_IS_ARCHIVE_BUNDLE, isArchiveBundle);
-        outState.putInt(KEY_ARCHIVE_KIND, archiveKind.ordinal());
-
-        if (!allAvailableApks.isEmpty()) {
-            ArrayList<String> paths = new ArrayList<>();
-            for (File f : allAvailableApks) {
-                if (f != null && f.exists()) paths.add(f.getAbsolutePath());
-            }
-            outState.putStringArrayList(KEY_ALL_AVAILABLE_APKS, paths);
-        }
-
-        if (selectedApkStates != null) {
-            outState.putBooleanArray(KEY_SELECTED_APK_STATES, selectedApkStates);
-        }
-
-        if (baseApkFile != null && baseApkFile.exists()) {
-            outState.putString(KEY_SELECTED_BASE_APK_FILE, baseApkFile.getAbsolutePath());
-        }
+    protected void onStart() {
+        super.onStart();
+        InstallEvents.attach(this);
     }
 
-    private void restoreInstanceState(Bundle savedInstanceState) {
-        String path = savedInstanceState.getString(KEY_SELECTED_SOURCE_FILE);
-        if (!TextUtils.isEmpty(path)) selectedSourceFile = new File(path);
-
-        path = savedInstanceState.getString(KEY_EXTRACTION_DIR);
-        if (!TextUtils.isEmpty(path)) extractionDir = new File(path);
-
-        path = savedInstanceState.getString(KEY_BASE_APK_FILE);
-        if (!TextUtils.isEmpty(path)) baseApkFile = new File(path);
-
-        selectedPackageName = savedInstanceState.getString(KEY_SELECTED_PACKAGE_NAME, "");
-        selectedAppLabel = savedInstanceState.getString(KEY_SELECTED_APP_LABEL, "");
-        isArchiveBundle = savedInstanceState.getBoolean(KEY_IS_ARCHIVE_BUNDLE, false);
-
-        int kindOrdinal = savedInstanceState.getInt(KEY_ARCHIVE_KIND, ArchiveKind.APK.ordinal());
-        archiveKind = ArchiveKind.values()[kindOrdinal];
-
-        ArrayList<String> apkPaths = savedInstanceState.getStringArrayList(KEY_ALL_AVAILABLE_APKS);
-        if (apkPaths != null) {
-            allAvailableApks.clear();
-            for (String p : apkPaths) {
-                File f = new File(p);
-                if (f.exists()) allAvailableApks.add(f);
-            }
-        }
-
-        selectedApkStates = savedInstanceState.getBooleanArray(KEY_SELECTED_APK_STATES);
-
-        path = savedInstanceState.getString(KEY_SELECTED_BASE_APK_FILE);
-        if (!TextUtils.isEmpty(path)) baseApkFile = new File(path);
-
-        if (selectedSourceFile != null && selectedSourceFile.exists() && baseApkFile != null && baseApkFile.exists()) {
-            btnSelectSplits.setVisibility(isArchiveBundle ? View.VISIBLE : View.GONE);
-            updateSelectedFileInfo();
-        }
+    @Override
+    protected void onStop() {
+        InstallEvents.detach(this);
+        super.onStop();
     }
 
     @Override
@@ -270,1105 +190,628 @@ public class MainActivity extends Activity implements View.OnClickListener {
     }
 
     @Override
-    protected void onResume() {
-        super.onResume();
-        if (installFlowLocked && (installLockDialog == null || !installLockDialog.isShowing())) {
-            showInstallLockDialog(installLockMessage);
-        }
+    protected void onDestroy() {
+        token.cancel();
+        worker.shutdownNow();
+        setBackBlocked(false);
+        if (!awaitingResult && !obbRunning) deleteJobAsync();
+        super.onDestroy();
     }
 
     private void handleIntent(Intent intent) {
-        if (intent == null || !Intent.ACTION_VIEW.equals(intent.getAction())) {
-            return;
+        if (intent == null || (intent.getFlags() & Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) != 0) return;
+        String action = intent.getAction();
+        Uri uri = null;
+        if (Intent.ACTION_VIEW.equals(action)) {
+            uri = intent.getData();
+        } else if (Intent.ACTION_SEND.equals(action)) {
+            uri = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                    ? intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri.class)
+                    : legacyStream(intent);
         }
-        Uri uri = intent.getData();
-        if (uri == null) return;
-        processUriAsSelected(uri);
+        if (uri != null) {
+            intent.setAction(Intent.ACTION_MAIN);
+            loadUri(uri);
+        }
     }
 
-    @Override
     @SuppressWarnings("deprecation")
-    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-        super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode != REQUEST_CODE_FILE_PICKER || resultCode != RESULT_OK || data == null) {
-            return;
-        }
-
-        Uri uri = data.getData();
-        if (uri == null) return;
-        try {
-            final int takeFlags = data.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
-            if (takeFlags != 0) {
-                getContentResolver().takePersistableUriPermission(uri, takeFlags);
-            }
-        } catch (Exception ignored) {
-        }
-
-        cleanupTempFiles();
-        resetUIAfterInstall();
-        processSelectedUri(uri);
+    private static Uri legacyStream(Intent intent) {
+        Object extra = intent.getParcelableExtra(Intent.EXTRA_STREAM);
+        return extra instanceof Uri ? (Uri) extra : null;
     }
 
-    private void processSelectedUri(Uri uri) {
-        String originalFileName = FileUtils.getFileName(this, uri);
-        final String resolvedFileName = TextUtils.isEmpty(originalFileName) ? "selected_file" : originalFileName;
-
-        final String lowerName = FileUtils.safeLower(resolvedFileName);
-        final String safeName = FileUtils.sanitizeFileName(resolvedFileName);
-
-        if (lowerName.endsWith(".apk")) {
-            selectedSourceFile = new File(getCacheDir(), safeName);
-            postStatus("APK をコピー中...");
-
-            new Thread(() -> {
-                if (!FileUtils.copyUriToFile(this, uri, selectedSourceFile)) {
-                    postStatus("コピー失敗");
-                    toast("ファイルのコピーに失敗しました");
-                    selectedSourceFile = null;
-                    return;
-                }
-
-                isArchiveBundle = false;
-                archiveContainsObb = false;
-                baseApkFile = selectedSourceFile;
-                archiveMetadata = new ArchiveMetadata();
-                selectedPackageName = "";
-                selectedAppLabel = "";
-
-                PackageInfo pi = ApkSignatureUtils.readArchiveInfo(this, baseApkFile);
-                if (pi != null && !TextUtils.isEmpty(pi.packageName)) {
-                    selectedPackageName = pi.packageName;
-                }
-
-                runOnUiThread(this::updateSelectedFileInfo);
-            }).start();
-            return;
-        }
-
-        if (lowerName.endsWith(".xapk") || lowerName.endsWith(".apks") || lowerName.endsWith(".apkm") || lowerName.endsWith(".zip")) {
-            selectedSourceFile = new File(getCacheDir(), safeName);
-            postStatus("アーカイブをコピー中...");
-
-            new Thread(() -> {
-                if (!FileUtils.copyUriToFile(this, uri, selectedSourceFile)) {
-                    postStatus("コピー失敗");
-                    toast("ファイルのコピーに失敗しました");
-                    selectedSourceFile = null;
-                    return;
-                }
-                processArchive(selectedSourceFile);
-            }).start();
-            return;
-        }
-
-        toast("ファイルを選択してください");
-        cleanupTempFiles();
-    }
-
-    private void processUriAsSelected(Uri uri) {
-        if (uri == null) return;
-
-        try {
-            getContentResolver().takePersistableUriPermission(uri,
-                    Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
-        } catch (Exception ignored) {
-        }
-
-        cleanupTempFiles();
-        resetUIAfterInstall();
-        processSelectedUri(uri);
-    }
-
-    private void processArchive(File archiveFile) {
-        postStatus("アーカイブを解析中...");
-        ArchiveUtils.ArchiveInspection inspection = ArchiveUtils.inspectArchive(archiveFile);
-        archiveKind = inspection.kind;
-        archiveMetadata = inspection.metadata != null ? inspection.metadata : new ArchiveMetadata();
-        archiveContainsObb = inspection.containsObb;
-
-        extractionDir = new File(getCacheDir(), "bundle_extract_" + System.currentTimeMillis());
-        if (!extractionDir.mkdirs() && !extractionDir.exists()) {
-            postStatus("解凍先の作成に失敗しました");
-            cleanupTempFiles();
-            return;
-        }
-
-        boolean unzipOk = ArchiveUtils.safeUnzipRelevant(archiveFile, extractionDir, archiveKind, false);
-
-        if (!unzipOk) {
-            postStatus("解凍失敗");
-            cleanupTempFiles();
-            return;
-        }
-
-        List<File> allApks = ArchiveUtils.dedupeFiles(ArchiveUtils.findInstallableApkFiles(extractionDir, archiveKind));
-
-        if (allApks.isEmpty()) {
-            postStatus("APK が見つかりません");
-            cleanupTempFiles();
-            return;
-        }
-
-        Map<String, List<File>> groups = ArchiveUtils.groupApksByPackageName(this, allApks);
-        List<File> chosen = ArchiveUtils.chooseBestGroup(groups, archiveMetadata, allApks);
-        if (chosen.isEmpty()) {
-            postStatus("有効な APK が見つかりません");
-            cleanupTempFiles();
-            return;
-        }
-
-        ArchiveUtils.sortApks(chosen);
-
-        allAvailableApks.clear();
-        allAvailableApks.addAll(chosen);
-
-        baseApkCandidates.clear();
-        baseApkCandidates.addAll(ArchiveUtils.findBundletoolBaseCandidates(allAvailableApks));
-        if (baseApkCandidates.isEmpty()) {
-            File fallbackBase = ArchiveUtils.findMainApkFile(chosen, archiveMetadata);
-            if (fallbackBase != null) baseApkCandidates.add(fallbackBase);
-        }
-
-        baseApkFile = ArchiveUtils.choosePreferredBundletoolBase(baseApkCandidates, archiveMetadata);
-        if (baseApkFile == null) {
-            baseApkFile = ArchiveUtils.findMainApkFile(chosen, archiveMetadata);
-        }
-        if (baseApkFile == null && !chosen.isEmpty()) {
-            baseApkFile = chosen.get(0);
-        }
-
-        if (baseApkFile == null || !baseApkFile.exists()) {
-            postStatus("base.apk が特定できません");
-            cleanupTempFiles();
-            return;
-        }
-
-        selectedApkStates = new boolean[allAvailableApks.size()];
-        for (int i = 0; i < selectedApkStates.length; i++) selectedApkStates[i] = true;
-
-        applyDefaultApkSelection();
-
-        selectedPackageName = "";
-        selectedAppLabel = "";
-        readArchiveMetadata(baseApkFile);
-
-        if (TextUtils.isEmpty(selectedPackageName) && !TextUtils.isEmpty(archiveMetadata.packageName)) {
-            selectedPackageName = archiveMetadata.packageName;
-        }
-        if (TextUtils.isEmpty(selectedAppLabel) && !TextUtils.isEmpty(archiveMetadata.appName)) {
-            selectedAppLabel = archiveMetadata.appName;
-        }
-
-        isArchiveBundle = archiveKind != ArchiveKind.APK;
-
+    private void ui(Runnable runnable) {
         runOnUiThread(() -> {
-            btnSelectSplits.setVisibility(isArchiveBundle ? View.VISIBLE : View.GONE);
-            updateSelectedFileInfo();
+            if (!isDestroyed() && !isFinishing()) runnable.run();
         });
     }
 
-    private void applyDefaultApkSelection() {
-        if (allAvailableApks.isEmpty() || selectedApkStates == null) return;
-
-        List<File> relevantApks = ArchiveUtils.selectDeviceRelevantApks(this, allAvailableApks, archiveKind);
-        for (int i = 0; i < allAvailableApks.size(); i++) {
-            File apk = allAvailableApks.get(i);
-            if (apk == null) continue;
-
-            if (archiveKind == ArchiveKind.APKS_BUNDLETOOL && ArchiveUtils.isBundletoolBaseCandidate(apk)) {
-                selectedApkStates[i] = sameFile(apk, baseApkFile);
-                continue;
-            }
-
-            selectedApkStates[i] = relevantApks.contains(apk);
-        }
-
-        if (archiveKind == ArchiveKind.APKS_BUNDLETOOL) {
-            ensureSingleBundletoolBaseSelection();
-        }
+    private void toast(int resId) {
+        Toast.makeText(this, resId, Toast.LENGTH_LONG).show();
     }
 
-    private boolean isCompatibleWithDevice(String name, String deviceArch) {
-        if (name == null) return false;
-        String lower = name.toLowerCase(Locale.US);
-        if ("arm64".equals(deviceArch)) {
-            return lower.contains("arm64") || lower.contains("aarch64") || lower.contains("v8a") || lower.contains("v7a") || lower.contains("armeabi");
-        } else if ("arm".equals(deviceArch)) {
-            return lower.contains("v7a") || lower.contains("armeabi") || lower.contains("armv7");
-        } else if ("x86_64".equals(deviceArch)) {
-            return lower.contains("x86_64") || lower.contains("x86-64") || lower.contains("x86");
-        } else if ("x86".equals(deviceArch)) {
-            return lower.contains("x86");
-        }
-        return false;
-    }
-
-    private void setSelectedBundletoolBase(File selectedApk, AlertDialog dialog) {
-        if (selectedApk == null || !selectedApk.exists()) return;
-        baseApkFile = selectedApk;
-
-        if (selectedApkStates == null || allAvailableApks.isEmpty()) return;
-
-        for (int i = 0; i < allAvailableApks.size(); i++) {
-            File apk = allAvailableApks.get(i);
-            if (apk == null) continue;
-            if (ArchiveUtils.isBundletoolBaseCandidate(apk)) {
-                boolean checked = sameFile(apk, selectedApk);
-                selectedApkStates[i] = checked;
-                if (dialog != null && dialog.getListView() != null) {
-                    dialog.getListView().setItemChecked(i, checked);
-                }
-            }
-        }
-        updateSelectedFileInfo();
-    }
-
-    private void ensureSingleBundletoolBaseSelection() {
-        if (archiveKind != ArchiveKind.APKS_BUNDLETOOL) return;
-        if (selectedApkStates == null || allAvailableApks.isEmpty()) return;
-
-        if (baseApkFile == null || !containsFile(allAvailableApks, baseApkFile)) {
-            File preferred = ArchiveUtils.choosePreferredBundletoolBase(baseApkCandidates, archiveMetadata);
-            if (preferred == null) {
-                preferred = ArchiveUtils.findMainApkFile(allAvailableApks, archiveMetadata);
-            }
-            if (preferred == null && !allAvailableApks.isEmpty()) {
-                preferred = allAvailableApks.get(0);
-            }
-            baseApkFile = preferred;
-        }
-
-        for (int i = 0; i < allAvailableApks.size(); i++) {
-            File apk = allAvailableApks.get(i);
-            if (apk == null) continue;
-            if (ArchiveUtils.isBundletoolBaseCandidate(apk)) {
-                selectedApkStates[i] = sameFile(apk, baseApkFile);
-            }
-        }
-    }
-
-    private List<File> normalizeBundletoolSelection(List<File> sourceApks) {
-        List<File> out = new ArrayList<>();
-        if (sourceApks == null || sourceApks.isEmpty()) return out;
-
-        File preferredBase = resolvePreferredBundletoolBase(sourceApks);
-        for (File apk : sourceApks) {
-            if (apk == null || !apk.exists()) continue;
-            if (ArchiveUtils.isBundletoolBaseCandidate(apk)) {
-                if (preferredBase != null && sameFile(apk, preferredBase)) {
-                    out.add(apk);
-                }
-            } else {
-                out.add(apk);
-            }
-        }
-
-        if (out.isEmpty() && preferredBase != null) {
-            out.add(preferredBase);
-        }
-        return ArchiveUtils.dedupeFiles(out);
-    }
-
-    private File resolvePreferredBundletoolBase(List<File> apks) {
-        if (apks == null || apks.isEmpty()) return null;
-
-        if (baseApkFile != null) {
-            for (File apk : apks) {
-                if (sameFile(apk, baseApkFile)) return apk;
-            }
-            File hinted = ArchiveUtils.findApkByHint(apks, baseApkFile.getName());
-            if (hinted != null && ArchiveUtils.isBundletoolBaseCandidate(hinted)) return hinted;
-        }
-
-        List<File> candidates = ArchiveUtils.findBundletoolBaseCandidates(apks);
-        File preferred = ArchiveUtils.choosePreferredBundletoolBase(candidates, archiveMetadata);
-        if (preferred != null) return preferred;
-
-        for (File apk : apks) {
-            if (apk != null && ArchiveUtils.isBundletoolBaseCandidate(apk)) return apk;
-        }
-        return apks.get(0);
-    }
-
-    private boolean containsFile(List<File> files, File target) {
-        if (files == null || files.isEmpty() || target == null) return false;
-        for (File file : files) {
-            if (sameFile(file, target)) return true;
-        }
-        return false;
-    }
-
-    private boolean sameFile(File a, File b) {
-        if (a == null || b == null) return false;
-        try {
-            return a.getCanonicalPath().equals(b.getCanonicalPath());
-        } catch (Exception e) {
-            return a.getAbsolutePath().equals(b.getAbsolutePath());
-        }
-    }
-
-    private String buildArchiveDisplayName(File file) {
-        if (file == null) return "";
-        if (archiveKind == ArchiveKind.APKS_BUNDLETOOL && ArchiveUtils.isBundletoolBaseCandidate(file)) {
-            if (sameFile(file, baseApkFile)) {
-                return "[BASE] " + file.getName();
-            }
-            return "[BASE候補] " + file.getName();
-        }
-        return ArchiveUtils.getCategorizedApkName(file, archiveKind);
-    }
-
-    private void showSelectSplitsDialog() {
-        if (allAvailableApks == null || allAvailableApks.isEmpty()) return;
-        if (selectedApkStates == null || selectedApkStates.length != allAvailableApks.size()) {
-            selectedApkStates = new boolean[allAvailableApks.size()];
-            applyDefaultApkSelection();
-        }
-
-        String[] displayNames = new String[allAvailableApks.size()];
-        for (int i = 0; i < allAvailableApks.size(); i++) {
-            displayNames[i] = buildArchiveDisplayName(allAvailableApks.get(i));
-        }
-
-        new AlertDialog.Builder(this)
-                .setTitle("インストールするAPKを選択")
-                .setMultiChoiceItems(displayNames, selectedApkStates, (dialog, which, isChecked) -> {
-                    File selectedApk = allAvailableApks.get(which);
-                    AlertDialog alertDialog = (AlertDialog) dialog;
-                    if (selectedApk == null) return;
-
-                    if (archiveKind == ArchiveKind.APKS_BUNDLETOOL && ArchiveUtils.isBundletoolBaseCandidate(selectedApk)) {
-                        if (isChecked) {
-                            setSelectedBundletoolBase(selectedApk, alertDialog);
-                        } else {
-                            alertDialog.getListView().setItemChecked(which, true);
-                            selectedApkStates[which] = true;
-                            Toast.makeText(MainActivity.this, "Base APK は必須です", Toast.LENGTH_SHORT).show();
-                        }
-                        return;
-                    }
-
-                    selectedApkStates[which] = isChecked;
-                })
-                .setPositiveButton("完了", (dialog, which) -> {
-                    if (archiveKind == ArchiveKind.APKS_BUNDLETOOL) {
-                        ensureSingleBundletoolBaseSelection();
-                    }
-                    updateSelectedFileInfo();
-                })
-                .setNegativeButton("キャンセル", null)
-                .show();
-    }
-
-    private void updateSelectedFileInfo() {
-        if (baseApkFile == null || !baseApkFile.exists()) {
-            return;
-        }
-        if (!isArchiveBundle && (selectedSourceFile == null || !selectedSourceFile.exists())) {
-            return;
-        }
-
-        if (selectedAppLabel == null) selectedAppLabel = "";
-        if (isArchiveBundle) {
-            tvFileName.setText((selectedAppLabel.isEmpty() ? selectedSourceFile.getName() : selectedAppLabel) + " (アプリ)");
-            long totalSize = 0;
-            int count = 0;
-            if (allAvailableApks != null && selectedApkStates != null) {
-                for (int i = 0; i < allAvailableApks.size(); i++) {
-                    if (selectedApkStates[i]) {
-                        totalSize += allAvailableApks.get(i).length();
-                        count++;
-                    }
-                }
-            }
-            tvSize.setText(FileUtils.formatFileSize(totalSize) + " / 選択中: " + count + "個のAPK");
+    private void setBusy(boolean value) {
+        busy = value;
+        btnSelect.setEnabled(!value);
+        btnSelectSplits.setEnabled(!value);
+        btnInstall.setEnabled(!value && loaded != null && !installed);
+        btnOpen.setEnabled(!value);
+        progress.setVisibility(value ? View.VISIBLE : View.GONE);
+        if (value) progress.setIndeterminate(true);
+        if (value) {
+            getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         } else {
-            tvFileName.setText(selectedAppLabel.isEmpty() ? selectedSourceFile.getName() : selectedAppLabel);
-            tvSize.setText(FileUtils.formatFileSize(selectedSourceFile.length()));
-        }
-
-        try {
-            PackageInfo pi = ApkSignatureUtils.readArchiveInfo(this, baseApkFile);
-            if (pi != null && pi.applicationInfo != null) {
-                ApplicationInfo ai = pi.applicationInfo;
-                ai.sourceDir = baseApkFile.getAbsolutePath();
-                ai.publicSourceDir = baseApkFile.getAbsolutePath();
-                Drawable icon = getPackageManager().getApplicationIcon(ai);
-                ivIcon.setImageDrawable(icon);
-            } else {
-                ivIcon.setImageResource(android.R.drawable.sym_def_app_icon);
-            }
-        } catch (Exception e) {
-            ivIcon.setImageResource(android.R.drawable.sym_def_app_icon);
-        }
-
-        btnInstall.setEnabled(true);
-        tvStatus.setText("インストールの準備が完了しました");
-    }
-
-    private void startPackageInstall() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            if (!getPackageManager().canRequestPackageInstalls()) {
-                showUnknownInstallDialog();
-                toast("不明なアプリのインストール許可が必要です");
-                return;
-            }
-        }
-
-        if (archiveContainsObb && !hasAllFilesAccess()) {
-            showAllFilesAccessDialog();
-            toast("OBB の配置には全ファイルアクセス権が必要です");
-            return;
-        }
-
-        btnInstall.setEnabled(false);
-        if (archiveContainsObb) {
-            showInstallLockDialog("しばらく時間がかかります……\nお待ちください");
-        }
-        postStatus("署名と整合性を確認中...");
-        new Thread(() -> {
-            List<File> apksForInstall = prepareApksForInstall(filesToInstall);
-            if (apksForInstall == null || apksForInstall.isEmpty()) {
-                runOnUiThread(() -> btnInstall.setEnabled(true));
-                return;
-            }
-
-            if (archiveKind == ArchiveKind.APKS_BUNDLETOOL) {
-                File keptBase = null;
-                for (File apk : apksForInstall) {
-                    if (sameFile(apk, baseApkFile)) {
-                        keptBase = apk;
-                        break;
-                    }
-                }
-                if (keptBase != null) {
-                    baseApkFile = keptBase;
-                } else {
-                    baseApkFile = ArchiveUtils.findMainApkFile(apksForInstall, archiveMetadata);
-                    if (baseApkFile == null && !apksForInstall.isEmpty()) baseApkFile = apksForInstall.get(0);
-                }
-            } else {
-                baseApkFile = ArchiveUtils.findMainApkFile(apksForInstall, archiveMetadata);
-                if (baseApkFile == null && !apksForInstall.isEmpty()) baseApkFile = apksForInstall.get(0);
-            }
-
-            if (baseApkFile == null || !baseApkFile.exists()) {
-                postStatus("base.apk を特定できません");
-                toast("base APK の特定に失敗しました");
-                runOnUiThread(() -> btnInstall.setEnabled(true));
-                return;
-            }
-
-            if (TextUtils.isEmpty(selectedPackageName)) {
-                PackageInfo pi = ApkSignatureUtils.readArchiveInfo(this, baseApkFile);
-                if (pi != null && !TextUtils.isEmpty(pi.packageName)) selectedPackageName = pi.packageName;
-            }
-
-            if (isArchiveBundle && !ApkSignatureUtils.validateSelectedApksConsistency(this, apksForInstall, baseApkFile, new ApkSignatureUtils.StatusReporter() {
-                @Override
-                public void post(String message) {
-                    postStatus(message);
-                }
-
-                @Override
-                public void toast(String message) {
-                    MainActivity.this.toast(message);
-                }
-            })) {
-                runOnUiThread(() -> btnInstall.setEnabled(true));
-                return;
-            }
-
-            PackageInfo installedInfo = ApkSignatureUtils.getInstalledPackageInfo(this, selectedPackageName);
-            if (!ApkSignatureUtils.validateUpdateCompatibilityIfNeeded(this, selectedPackageName, baseApkFile, installedInfo, new ApkSignatureUtils.StatusReporter() {
-                @Override
-                public void post(String message) {
-                    postStatus(message);
-                }
-
-                @Override
-                public void toast(String message) {
-                    MainActivity.this.toast(message);
-                }
-            })) {
-                runOnUiThread(() -> btnInstall.setEnabled(true));
-                return;
-            }
-
-            postStatus("インストール処理中...");
-            long totalSize = FileUtils.calcTotalSize(apksForInstall);
-            PackageInstaller.Session session = null;
-
-            try {
-                PackageInstaller packageInstaller = getPackageManager().getPackageInstaller();
-                int mode = (installedInfo != null)
-                        ? PackageInstaller.SessionParams.MODE_INHERIT_EXISTING
-                        : PackageInstaller.SessionParams.MODE_FULL_INSTALL;
-                PackageInstaller.SessionParams params = new PackageInstaller.SessionParams(mode);
-                params.setSize(totalSize);
-                params.setAppPackageName(selectedPackageName);
-
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    params.setPackageSource(PackageInstaller.PACKAGE_SOURCE_LOCAL_FILE);
-                }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && mode == PackageInstaller.SessionParams.MODE_INHERIT_EXISTING) {
-                    params.setDontKillApp(true);
-                }
-
-                int sessionId = packageInstaller.createSession(params);
-                session = packageInstaller.openSession(sessionId);
-
-                for (File apkFile : apksForInstall) {
-                    if (apkFile == null || !apkFile.exists()) continue;
-                    String writeName = (apkFile.equals(baseApkFile)) ? "base.apk" : apkFile.getName();
-                    try (FileInputStream fis = new FileInputStream(apkFile);
-                         OutputStream out = session.openWrite(writeName, 0, apkFile.length())) {
-                        byte[] buffer = new byte[8192];
-                        int len;
-                        while ((len = fis.read(buffer)) > 0) out.write(buffer, 0, len);
-                        out.flush();
-                        session.fsync(out);
-                    }
-                }
-
-                session.setStagingProgress(1.0f);
-                Intent callbackIntent = new Intent(ACTION_INSTALL_COMPLETE);
-                callbackIntent.setPackage(getPackageName());
-
-                int piFlags = PendingIntent.FLAG_UPDATE_CURRENT;
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) piFlags |= PendingIntent.FLAG_MUTABLE;
-
-                PendingIntent pendingIntent = PendingIntent.getBroadcast(
-                        MainActivity.this, sessionId, callbackIntent, piFlags
-                );
-                session.commit(pendingIntent.getIntentSender());
-                showInstallLockDialog("インストール中……");
-                postStatus("インストール要求を送信しました");
-            } catch (Exception e) {
-                dismissInstallLockDialog();
-                final String errorMsg = (e.getMessage() != null) ? e.getMessage() : "不明なエラー";
-                postStatus("インストール開始エラー: " + errorMsg);
-                toast("インストール開始に失敗しました");
-                runOnUiThread(() -> btnInstall.setEnabled(true));
-            } finally {
-                if (session != null) {
-                    try { session.close(); } catch (Exception ignored) {}
-                }
-            }
-        }).start();
-    }
-
-    private List<File> prepareApksForInstall(List<File> sourceApks) {
-        if (sourceApks == null || sourceApks.isEmpty()) return new ArrayList<>();
-        List<File> input = new ArrayList<>();
-        for (File apk : sourceApks) {
-            if (apk != null && apk.exists()) input.add(apk);
-        }
-        if (input.isEmpty()) return new ArrayList<>();
-
-        if (archiveKind == ArchiveKind.APKS_BUNDLETOOL) {
-            input = normalizeBundletoolSelection(input);
-        }
-
-        postStatus("APK の署名状態を確認しています...");
-        boolean allSigned = true;
-        for (File apk : input) {
-            if (!ApkSignatureUtils.hasValidApkSignature(this, apk)) {
-                allSigned = false;
-                break;
-            }
-        }
-
-        if (allSigned) {
-            if (archiveKind == ArchiveKind.APKS_BUNDLETOOL) {
-                postStatus("bundletool 由来の APK Set です。既存署名を保持します。");
-            } else if (archiveKind == ArchiveKind.APKM) {
-                postStatus("APKM の APK は既存署名を保持します。");
-            } else {
-                postStatus("署名済みの APK です。再署名はスキップします。");
-            }
-            ArchiveUtils.sortApks(input);
-            return input;
-        }
-
-        postStatus("未署名の APK があるため署名します...");
-        return ApkSignatureUtils.signAllApks(this, input, getCacheDir(), new ApkSignatureUtils.StatusReporter() {
-            @Override
-            public void post(String message) {
-                postStatus(message);
-            }
-
-            @Override
-            public void toast(String message) {
-                MainActivity.this.toast(message);
-            }
-        });
-    }
-
-    private void readArchiveMetadata(File apkFile) {
-        if (apkFile == null) {
-            selectedPackageName = "";
-            selectedAppLabel = "";
-            return;
-        }
-        try {
-            PackageInfo pi = ApkSignatureUtils.readArchiveInfo(this, apkFile);
-            if (pi == null || pi.applicationInfo == null) {
-                selectedPackageName = archiveMetadata != null ? archiveMetadata.packageName : "";
-                selectedAppLabel = archiveMetadata != null ? archiveMetadata.appName : "";
-                return;
-            }
-            selectedPackageName = pi.packageName != null ? pi.packageName : "";
-            ApplicationInfo ai = pi.applicationInfo;
-            ai.sourceDir = apkFile.getAbsolutePath();
-            ai.publicSourceDir = apkFile.getAbsolutePath();
-            CharSequence label = null;
-            try { label = ai.loadLabel(getPackageManager()); } catch (Exception ignored) {}
-            selectedAppLabel = (label != null) ? label.toString() : (archiveMetadata != null ? archiveMetadata.appName : "");
-        } catch (Exception e) {
-            selectedPackageName = archiveMetadata != null ? archiveMetadata.packageName : "";
-            selectedAppLabel = archiveMetadata != null ? archiveMetadata.appName : "";
+            getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         }
     }
 
-    private void handleInstallResult(Intent intent) {
-        if (intent == null) return;
-        int status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE);
-        String message = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);
+    private boolean isBackBlocked() {
+        return awaitingResult || obbRunning;
+    }
 
-        switch (status) {
-            case PackageInstaller.STATUS_SUCCESS:
-                if (archiveContainsObb) {
-                    postStatus("インストール成功、OBB を移動中...");
-                    updateInstallLockDialogMessage("しばらく時間がかかります……\nお待ちください");
-                    new Thread(() -> {
-                        boolean obbMoved = moveObbFilesToPublicStorage();
-                        runOnUiThread(() -> completeSuccessfulInstall(obbMoved));
-                    }).start();
-                } else {
-                    completeSuccessfulInstall(true);
-                }
-                break;
-            case PackageInstaller.STATUS_PENDING_USER_ACTION:
-                updateInstallLockDialogMessage("インストール処理進行中……");
-                Intent confirmationIntent;
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    confirmationIntent = intent.getParcelableExtra(Intent.EXTRA_INTENT, Intent.class);
-                } else {
-                    confirmationIntent = intent.getParcelableExtra(Intent.EXTRA_INTENT);
-                }
-                if (confirmationIntent != null) {
-                    try {
-                        confirmationIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                        startActivity(confirmationIntent);
-                    } catch (Exception e) {
-                        toast("確認画面を起動できませんでした");
-                    }
-                }
-                break;
-            case PackageInstaller.STATUS_FAILURE_ABORTED:
-                dismissInstallLockDialog();
-                postStatus("インストール失敗: 中断されました");
-                toast("インストールが中断されました");
-                btnInstall.setEnabled(true);
-                break;
-            case PackageInstaller.STATUS_FAILURE_BLOCKED:
-                dismissInstallLockDialog();
-                postStatus("インストール失敗: ブロックされました");
-                toast("インストールがブロックされました");
-                btnInstall.setEnabled(true);
-                break;
-            case PackageInstaller.STATUS_FAILURE_CONFLICT:
-                dismissInstallLockDialog();
-                postStatus("インストール失敗: 既存のアプリと署名が競合しています。");
-                toast("署名の競合エラーです");
-                btnInstall.setEnabled(true);
-                break;
-            case PackageInstaller.STATUS_FAILURE_INCOMPATIBLE:
-                dismissInstallLockDialog();
-                postStatus("インストール失敗: 互換性がありません");
-                toast("端末との互換性エラーです");
-                btnInstall.setEnabled(true);
-                break;
-            case PackageInstaller.STATUS_FAILURE_INVALID:
-                dismissInstallLockDialog();
-                postStatus("インストール失敗: APKファイルが不正です");
-                toast("無効なAPKファイルです");
-                btnInstall.setEnabled(true);
-                break;
-            case PackageInstaller.STATUS_FAILURE_STORAGE:
-                dismissInstallLockDialog();
-                postStatus("インストール失敗: ストレージ不足");
-                toast("ストレージ容量が不足しています");
-                btnInstall.setEnabled(true);
-                break;
-            default:
-                dismissInstallLockDialog();
-                String errorDetail = (message != null && !message.isEmpty()) ? message : "詳細不明";
-                postStatus("インストール失敗 (" + status + "): " + errorDetail);
-                toast("インストールに失敗しました");
-                btnInstall.setEnabled(true);
-                break;
+    private void setBackBlocked(boolean blocked) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return;
+        if (backGuard == null) {
+            if (!blocked) return;
+            backGuard = new BackGuard(this, () -> toast(R.string.toast_busy));
         }
-    }
-
-    private void completeSuccessfulInstall(boolean obbMoved) {
-        dismissInstallLockDialog();
-        if (archiveContainsObb && !obbMoved) {
-            postStatus("インストール成功（OBB の移動は失敗しました）");
-            toast("インストールは成功しましたが、OBB の配置に失敗しました");
-        } else {
-            postStatus("インストール成功！");
-            toast("アプリが正常にインストールされました");
-        }
-        cleanupTempFiles();
-        resetUIAfterInstall();
-    }
-
-    private boolean moveObbFilesToPublicStorage() {
-        if (!archiveContainsObb) return true;
-        String packageName = !TextUtils.isEmpty(selectedPackageName)
-                ? selectedPackageName
-                : (archiveMetadata != null ? archiveMetadata.packageName : "");
-        if (TextUtils.isEmpty(packageName)) return false;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
-            postStatus("OBB の移動には全ファイルアクセス権が必要です");
-            toast("OBB を配置するには全ファイルアクセス権を許可してください");
-            return false;
-        }
-        if (selectedSourceFile == null || !selectedSourceFile.exists()) return false;
-
-        List<ObbEntry> obbEntries = collectObbEntriesFromArchive(selectedSourceFile);
-        if (obbEntries.isEmpty()) return true;
-
-        File obbRoot = new File(Environment.getExternalStorageDirectory(), "Android/obb/" + packageName);
-        if (!obbRoot.exists() && !obbRoot.mkdirs() && !obbRoot.exists()) {
-            return false;
-        }
-
-        try (java.util.zip.ZipFile zipFile = new java.util.zip.ZipFile(selectedSourceFile)) {
-            for (ObbEntry obbEntry : obbEntries) {
-                if (obbEntry == null || TextUtils.isEmpty(obbEntry.entryName)) continue;
-                java.util.zip.ZipEntry entry = zipFile.getEntry(obbEntry.entryName);
-                if (entry == null || entry.isDirectory()) continue;
-
-                File dst = buildDestinationObbFile(obbEntry.entryName, obbRoot, packageName);
-                if (dst == null) continue;
-                File parent = dst.getParentFile();
-                if (parent != null && !parent.exists() && !parent.mkdirs() && !parent.exists()) {
-                    return false;
-                }
-
-                try (java.io.InputStream is = new java.io.BufferedInputStream(zipFile.getInputStream(entry));
-                     java.io.OutputStream os = new java.io.BufferedOutputStream(new java.io.FileOutputStream(dst))) {
-                    byte[] buffer = new byte[64 * 1024];
-                    int len;
-                    while ((len = is.read(buffer)) > 0) os.write(buffer, 0, len);
-                    os.flush();
-                }
-            }
-        } catch (Exception e) {
-            return false;
-        }
-        return true;
-    }
-
-    private static final class ObbEntry {
-        final String entryName;
-
-        ObbEntry(String entryName) {
-            this.entryName = entryName;
-        }
-    }
-
-    private List<ObbEntry> collectObbEntriesFromArchive(File archiveFile) {
-        List<ObbEntry> out = new ArrayList<>();
-        if (archiveFile == null || !archiveFile.exists()) return out;
-        try (java.util.zip.ZipFile zipFile = new java.util.zip.ZipFile(archiveFile)) {
-            java.util.Enumeration<? extends java.util.zip.ZipEntry> entries = zipFile.entries();
-            while (entries.hasMoreElements()) {
-                java.util.zip.ZipEntry entry = entries.nextElement();
-                if (entry == null || entry.isDirectory()) continue;
-                String normalized = FileUtils.safeLower(entry.getName().replace('\\', '/'));
-                if (normalized.startsWith("android/obb/") || normalized.contains("/android/obb/") || normalized.endsWith(".obb")) {
-                    out.add(new ObbEntry(entry.getName()));
-                }
-            }
-        } catch (Exception ignored) {
-        }
-        return out;
-    }
-
-    private File buildDestinationObbFile(String entryName, File obbRoot, String packageName) {
-        if (TextUtils.isEmpty(entryName) || obbRoot == null) return null;
-        try {
-            String rel = entryName.replace('\\', '/');
-            while (rel.startsWith("/")) rel = rel.substring(1);
-            int obbIdx = rel.toLowerCase(Locale.US).indexOf("android/obb/");
-            if (obbIdx >= 0) rel = rel.substring(obbIdx + "android/obb/".length());
-            if (rel.toLowerCase(Locale.US).startsWith(packageName.toLowerCase(Locale.US) + "/")) {
-                rel = rel.substring(packageName.length() + 1);
-            }
-            if (TextUtils.isEmpty(rel)) rel = new File(entryName).getName();
-            return new File(obbRoot, rel);
-        } catch (Exception e) {
-            return new File(obbRoot, new File(entryName).getName());
-        }
-    }
-
-    private List<File> findFilesWithExtension(File root, String extension) {
-        List<File> out = new ArrayList<>();
-        if (root == null || !root.exists() || TextUtils.isEmpty(extension)) return out;
-        String wanted = extension.toLowerCase(Locale.US);
-        collectFilesWithExtension(root, wanted, out);
-        return out;
-    }
-
-    private void collectFilesWithExtension(File file, String extension, List<File> out) {
-        if (file == null || !file.exists() || out == null) return;
-        if (file.isDirectory()) {
-            File[] children = file.listFiles();
-            if (children == null) return;
-            for (File child : children) {
-                collectFilesWithExtension(child, extension, out);
-            }
-            return;
-        }
-        if (FileUtils.safeLower(file.getName()).endsWith(extension)) {
-            out.add(file);
-        }
-    }
-
-    private void resetUIAfterInstall() {
-        if (btnInstall != null) btnInstall.setEnabled(false);
-        if (btnSelectSplits != null) btnSelectSplits.setVisibility(View.GONE);
-        if (tvFileName != null) tvFileName.setText("ファイルを選択してください");
-        if (tvSize != null) tvSize.setText("");
-        if (tvStatus != null) tvStatus.setText("");
-        if (ivIcon != null) ivIcon.setImageResource(android.R.drawable.sym_def_app_icon);
-
-        selectedSourceFile = null;
-        extractionDir = null;
-        baseApkFile = null;
-        selectedPackageName = "";
-        selectedAppLabel = "";
-        archiveMetadata = new ArchiveMetadata();
-        archiveContainsObb = false;
-        isArchiveBundle = false;
-
-        filesToInstall.clear();
-        allAvailableApks.clear();
-        baseApkCandidates.clear();
-        selectedApkStates = null;
-    }
-
-    private void cleanupTempFiles() {
-        File source = selectedSourceFile;
-        File extract = extractionDir;
-        if (source != null) FileUtils.deleteIfUnderCache(this, source);
-        if (extract != null) FileUtils.deleteRecursive(extract);
-        selectedSourceFile = null;
-        extractionDir = null;
-    }
-
-    private void postStatus(final String message) {
-        runOnUiThread(() -> tvStatus.setText(message));
-    }
-
-    private void toast(final String message) {
-        runOnUiThread(() -> Toast.makeText(MainActivity.this, message, Toast.LENGTH_LONG).show());
-    }
-
-    private void showInstallLockDialog(final String message) {
-        runOnUiThread(() -> {
-            if (isFinishing()) return;
-            installFlowLocked = true;
-            installLockMessage = TextUtils.isEmpty(message) ? "インストール中……" : message;
-
-            try {
-                if (installLockDialog != null && installLockDialog.isShowing()) {
-                    installLockDialog.dismiss();
-                }
-            } catch (Exception ignored) {
-            }
-
-            AlertDialog.Builder builder = new AlertDialog.Builder(this)
-                    .setTitle("インストール中")
-                    .setMessage(installLockMessage)
-                    .setCancelable(false);
-
-            installLockDialog = builder.create();
-            installLockDialog.setCanceledOnTouchOutside(false);
-            installLockDialog.setOnKeyListener((dialog, keyCode, event) -> keyCode == KeyEvent.KEYCODE_BACK);
-            installLockDialog.show();
-
-            try {
-                if (installLockDialog.getWindow() != null) {
-                    installLockDialog.getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                }
-            } catch (Exception ignored) {
-            }
-
-            try {
-                if (getWindow() != null) {
-                    getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                }
-            } catch (Exception ignored) {
-            }
-        });
-    }
-
-    private void updateInstallLockDialogMessage(final String message) {
-        runOnUiThread(() -> {
-            installLockMessage = TextUtils.isEmpty(message) ? installLockMessage : message;
-            if (installLockDialog != null && installLockDialog.isShowing()) {
-                try {
-                    installLockDialog.setMessage(installLockMessage);
-                } catch (Exception ignored) {
-                }
-            }
-        });
-    }
-
-    private void dismissInstallLockDialog() {
-        runOnUiThread(() -> {
-            installFlowLocked = false;
-            installLockMessage = "インストール中……";
-            try {
-                if (installLockDialog != null) {
-                    installLockDialog.dismiss();
-                }
-            } catch (Exception ignored) {
-            }
-            installLockDialog = null;
-            try {
-                if (getWindow() != null) {
-                    getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                }
-            } catch (Exception ignored) {
-            }
-        });
-    }
-
-    private boolean hasAllFilesAccess() {
-        return Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager();
-    }
-
-    private void ensureStartupGuidance() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !getPackageManager().canRequestPackageInstalls()) {
-            showUnknownInstallDialog();
-            return;
-        }
-        if (!hasAllFilesAccess()) {
-            showAllFilesAccessDialog();
-        }
-    }
-
-    private void showAllFilesAccessDialog() {
-        if (isFinishing()) return;
-        new AlertDialog.Builder(this)
-                .setTitle("全ファイルアクセスが必要です")
-                .setMessage("OBB を配置するには、全ファイルへのアクセスを許可してください。")
-                .setPositiveButton("設定を開く", (dialog, which) -> {
-                    try {
-                        Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
-                        intent.setData(Uri.parse("package:" + getPackageName()));
-                        startActivity(intent);
-                    } catch (Exception first) {
-                        try {
-                            Intent intent = new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION);
-                            startActivity(intent);
-                        } catch (Exception e) {
-                            toast("設定画面を開けませんでした");
-                        }
-                    }
-                })
-                .setNegativeButton("閉じる", null)
-                .show();
-    }
-
-    private void showUnknownInstallDialog() {
-        if (isFinishing()) return;
-        new AlertDialog.Builder(this)
-                .setTitle("インストール許可が必要です")
-                .setMessage("アプリをインストールするには、\"不明なアプリのインストール\" を許可してください。")
-                .setPositiveButton("設定を開く", (dialog, which) -> {
-                    try {
-                        Intent settingsIntent = new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES);
-                        settingsIntent.setData(Uri.parse("package:" + getPackageName()));
-                        startActivity(settingsIntent);
-                    } catch (Exception e) {
-                        toast("設定画面を開けませんでした");
-                    }
-                })
-                .setNegativeButton("閉じる", null)
-                .show();
-    }
-
-    private void openFilePicker() {
-        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-        intent.addCategory(Intent.CATEGORY_OPENABLE);
-        intent.setType("*/*");
-        intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{
-                "application/vnd.android.package-archive",
-                "application/octet-stream",
-                "application/zip",
-                "*/*"
-        });
-        startActivityForResult(intent, REQUEST_CODE_FILE_PICKER);
-    }
-
-    @Override
-    public void onClick(View v) {
-        if (v.getId() == R.id.btn_select) {
-            openFilePicker();
-            return;
-        }
-
-        if (v.getId() == R.id.btn_select_splits) {
-            showSelectSplitsDialog();
-            return;
-        }
-
-        if (v.getId() == R.id.btn_install) {
-            filesToInstall.clear();
-            if (isArchiveBundle && archiveKind == ArchiveKind.APKS_BUNDLETOOL) {
-                ensureSingleBundletoolBaseSelection();
-            }
-            if (isArchiveBundle && allAvailableApks != null && selectedApkStates != null) {
-                for (int i = 0; i < allAvailableApks.size(); i++) {
-                    if (selectedApkStates[i]) filesToInstall.add(allAvailableApks.get(i));
-                }
-            } else if (!isArchiveBundle && selectedSourceFile != null) {
-                filesToInstall.add(selectedSourceFile);
-            }
-
-            if (filesToInstall.isEmpty()) {
-                toast("インストール対象のAPKが選択されていません");
-                return;
-            }
-
-            startPackageInstall();
-        }
+        backGuard.setBlocked(blocked);
     }
 
     @Override
     @SuppressWarnings("deprecation")
     public void onBackPressed() {
-        if (installFlowLocked) {
-            toast("インストール完了までお待ちください");
+        if (isBackBlocked()) {
+            toast(R.string.toast_busy);
             return;
         }
         super.onBackPressed();
     }
 
     @Override
-    protected void onDestroy() {
-        dismissInstallLockDialog();
-        try {
-            unregisterReceiver(installReceiver);
-        } catch (Exception ignored) {
+    public void onClick(View v) {
+        int id = v.getId();
+        if (id == R.id.btn_select) {
+            openPicker();
+        } else if (id == R.id.btn_select_splits) {
+            showSplitsDialog();
+        } else if (id == R.id.btn_install) {
+            onInstallClicked();
+        } else if (id == R.id.btn_open) {
+            openInstalledApp();
         }
-        super.onDestroy();
     }
+
+    private void openPicker() {
+        if (busy) {
+            toast(R.string.toast_busy);
+            return;
+        }
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        intent.setType("*/*");
+        try {
+            startActivityForResult(intent, REQUEST_PICK);
+        } catch (ActivityNotFoundException e) {
+            toast(R.string.toast_unsupported);
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQUEST_PICK && resultCode == RESULT_OK && data != null && data.getData() != null) {
+            loadUri(data.getData());
+        }
+    }
+
+    private void resetUi() {
+        loaded = null;
+        installed = false;
+        sessionId = -1;
+        ivIcon.setImageResource(R.drawable.ic_placeholder);
+        tvName.setText(R.string.placeholder_name);
+        tvPackage.setText(R.string.placeholder_hint);
+        tvVersion.setVisibility(View.GONE);
+        tvSize.setVisibility(View.GONE);
+        tvStatus.setText("");
+        btnSelectSplits.setVisibility(View.GONE);
+        btnOpen.setVisibility(View.GONE);
+        btnInstall.setEnabled(false);
+    }
+
+    private void deleteJobAsync() {
+        final File dir = jobDir;
+        jobDir = null;
+        if (dir == null) return;
+        Thread thread = new Thread(() -> FileUtils.deleteRecursive(dir), "cleanup");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    private void loadUri(Uri uri) {
+        if (busy) {
+            toast(R.string.toast_busy);
+            return;
+        }
+        token.cancel();
+        token = new CancelToken();
+        final CancelToken currentToken = token;
+        deleteJobAsync();
+        resetUi();
+        lastReportKey = null;
+
+        final File dir = new File(getCacheDir(), JOB_PREFIX + System.currentTimeMillis());
+        jobDir = dir;
+        pendingReadUri = null;
+        setBusy(true);
+        tvStatus.setText(R.string.status_analyzing);
+
+        worker.execute(() -> {
+            try {
+                BundleLoader.Loaded result = BundleLoader.load(getApplicationContext(), uri, dir, reporter, currentToken);
+                ui(() -> onLoaded(result));
+            } catch (UserException e) {
+                ui(() -> onLoadFailed(e, uri));
+            } catch (RuntimeException e) {
+                ui(() -> onLoadFailed(new UserException(R.string.error_read, String.valueOf(e.getMessage())), uri));
+            }
+        });
+    }
+
+    private void onLoaded(BundleLoader.Loaded result) {
+        loaded = result;
+        installed = false;
+        setBusy(false);
+        showLoaded();
+    }
+
+    private void onLoadFailed(UserException e, Uri uri) {
+        setBusy(false);
+        deleteJobAsync();
+        resetUi();
+        if (e.storagePermission && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && Build.VERSION.SDK_INT <= Build.VERSION_CODES.S_V2
+                && checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+            pendingReadUri = uri;
+            requestPermissions(new String[]{Manifest.permission.READ_EXTERNAL_STORAGE}, REQUEST_STORAGE_READ);
+            return;
+        }
+        tvStatus.setText(getString(e.resId, e.args));
+    }
+
+    private void showLoaded() {
+        BundleLoader.Loaded l = loaded;
+        if (l == null) return;
+
+        if (l.app.icon != null) ivIcon.setImageDrawable(l.app.icon);
+        else ivIcon.setImageResource(R.drawable.ic_placeholder);
+
+        tvName.setText(l.app.label.isEmpty() ? l.fileName : l.app.label);
+        tvPackage.setText(l.app.packageName);
+
+        String version = getString(R.string.line_version, l.app.versionName.isEmpty() ? "-" : l.app.versionName, l.app.versionCode);
+        if (l.installedVersionName != null) {
+            String from = l.installedVersionName.isEmpty() ? String.valueOf(l.installedVersionCode) : l.installedVersionName;
+            String to = l.app.versionName.isEmpty() ? String.valueOf(l.app.versionCode) : l.app.versionName;
+            version = version + "\n" + getString(R.string.line_update, from, to);
+        } else {
+            version = version + "\n" + getString(R.string.line_new);
+        }
+        tvVersion.setText(version);
+        tvVersion.setVisibility(View.VISIBLE);
+
+        updateSizeLine();
+        btnSelectSplits.setVisibility(l.entries.size() > 1 ? View.VISIBLE : View.GONE);
+        btnInstall.setEnabled(!busy && !installed);
+        tvStatus.setText(R.string.status_ready);
+    }
+
+    private void updateSizeLine() {
+        BundleLoader.Loaded l = loaded;
+        if (l == null) return;
+        long total = 0L;
+        int count = 0;
+        for (ApkEntry entry : l.entries) {
+            if (entry.checked) {
+                total += Math.max(0L, entry.size);
+                count++;
+            }
+        }
+        String size = Formatter.formatShortFileSize(this, total);
+        tvSize.setText(l.entries.size() > 1 ? getString(R.string.summary_bundle, size, count, l.entries.size()) : getString(R.string.summary_single, size));
+        tvSize.setVisibility(View.VISIBLE);
+    }
+
+    private String labelFor(ApkEntry entry) {
+        int baseCount = 0;
+        for (ApkEntry e : loaded.entries) {
+            if (e.isBase()) baseCount++;
+        }
+        int tag;
+        switch (entry.category) {
+            case BASE:
+                tag = baseCount > 1 && !entry.checked ? R.string.tag_base_candidate : R.string.tag_base;
+                break;
+            case LANGUAGE:
+                tag = R.string.tag_language;
+                break;
+            case ABI:
+                tag = R.string.tag_abi;
+                break;
+            case DENSITY:
+                tag = R.string.tag_density;
+                break;
+            default:
+                tag = R.string.tag_feature;
+                break;
+        }
+        return getString(tag) + " " + entry.displayName + " (" + Formatter.formatShortFileSize(this, Math.max(0L, entry.size)) + ")";
+    }
+
+    private void showSplitsDialog() {
+        final BundleLoader.Loaded l = loaded;
+        if (l == null || busy) return;
+
+        final List<ApkEntry> entries = l.entries;
+        final ApkEntry previousBase = l.baseEntry;
+        final CharSequence[] labels = new CharSequence[entries.size()];
+        final boolean[] checked = new boolean[entries.size()];
+        final boolean[] snapshot = new boolean[entries.size()];
+        for (int i = 0; i < entries.size(); i++) {
+            labels[i] = labelFor(entries.get(i));
+            checked[i] = entries.get(i).checked;
+            snapshot[i] = checked[i];
+        }
+
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.title_choose_apks)
+                .setMultiChoiceItems(labels, checked, (dialog, which, isChecked) -> {
+                    ApkEntry entry = entries.get(which);
+                    android.widget.ListView list = ((AlertDialog) dialog).getListView();
+                    if (entry.isBase()) {
+                        if (isChecked) {
+                            SplitSelector.selectBase(entries, entry);
+                            for (int i = 0; i < entries.size(); i++) {
+                                if (entries.get(i).isBase()) list.setItemChecked(i, entries.get(i) == entry);
+                            }
+                        } else {
+                            entry.checked = true;
+                            list.setItemChecked(which, true);
+                            toast(R.string.toast_base_required);
+                        }
+                    } else {
+                        entry.checked = isChecked;
+                    }
+                })
+                .setPositiveButton(R.string.action_ok, (dialog, which) -> onSelectionConfirmed(previousBase))
+                .setNegativeButton(R.string.action_cancel, (dialog, which) -> restoreSelection(entries, snapshot))
+                .setOnCancelListener(dialog -> restoreSelection(entries, snapshot))
+                .show();
+    }
+
+    private void restoreSelection(List<ApkEntry> entries, boolean[] snapshot) {
+        for (int i = 0; i < entries.size(); i++) entries.get(i).checked = snapshot[i];
+        if (loaded != null) loaded.baseEntry = SplitSelector.selectedBase(entries);
+        updateSizeLine();
+    }
+
+    private void onSelectionConfirmed(ApkEntry previousBase) {
+        final BundleLoader.Loaded l = loaded;
+        if (l == null) return;
+        ApkEntry base = SplitSelector.selectedBase(l.entries);
+        if (base == null) {
+            SplitSelector.selectBase(l.entries, previousBase);
+            base = previousBase;
+        }
+        l.baseEntry = base;
+        updateSizeLine();
+        if (base == previousBase) return;
+
+        final File dir = jobDir;
+        final CancelToken currentToken = token;
+        final ApkEntry newBase = base;
+        setBusy(true);
+        worker.execute(() -> {
+            try {
+                BundleLoader.extractMissing(l.source, new File(dir, "apks"), java.util.Collections.singletonList(newBase), reporter, currentToken);
+                BundleLoader.refreshApp(getApplicationContext(), l);
+                ui(() -> {
+                    setBusy(false);
+                    showLoaded();
+                });
+            } catch (UserException e) {
+                ui(() -> {
+                    setBusy(false);
+                    tvStatus.setText(getString(e.resId, e.args));
+                });
+            } catch (IOException e) {
+                ui(() -> {
+                    setBusy(false);
+                    tvStatus.setText(getString(R.string.error_read, String.valueOf(e.getMessage())));
+                });
+            }
+        });
+    }
+
+    private void requestInstallPermissionIfNeeded() {
+        if (installPromptShown) return;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !getPackageManager().canRequestPackageInstalls()) {
+            installPromptShown = true;
+            showInstallPermissionDialog();
+        }
+    }
+
+    @android.annotation.TargetApi(Build.VERSION_CODES.O)
+    private void showInstallPermissionDialog() {
+        if (isFinishing() || isDestroyed()) return;
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.permission_install_title)
+                .setMessage(R.string.permission_install_message)
+                .setPositiveButton(R.string.action_open_settings, (dialog, which) -> {
+                    Intent intent = new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:" + getPackageName()));
+                    startSettings(intent, null);
+                })
+                .setNegativeButton(R.string.action_close, null)
+                .show();
+    }
+
+    @android.annotation.TargetApi(Build.VERSION_CODES.R)
+    private void showAllFilesDialog() {
+        if (isFinishing() || isDestroyed()) return;
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.permission_files_title)
+                .setMessage(R.string.permission_files_message)
+                .setPositiveButton(R.string.action_open_settings, (dialog, which) -> {
+                    Intent primary = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:" + getPackageName()));
+                    Intent fallback = new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION);
+                    startSettings(primary, fallback);
+                })
+                .setNegativeButton(R.string.action_close, null)
+                .show();
+    }
+
+    private void startSettings(Intent primary, Intent fallback) {
+        try {
+            startActivity(primary);
+        } catch (RuntimeException first) {
+            try {
+                if (fallback == null) throw first;
+                startActivity(fallback);
+            } catch (RuntimeException second) {
+                toast(R.string.error_settings);
+            }
+        }
+    }
+
+    private boolean hasObbAccess() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) return Environment.isExternalStorageManager();
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            return checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED;
+        }
+        return true;
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        boolean granted = grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+        if (requestCode == REQUEST_STORAGE_READ) {
+            Uri uri = pendingReadUri;
+            pendingReadUri = null;
+            if (granted && uri != null) loadUri(uri);
+            else toast(R.string.toast_permission_denied);
+        } else if (requestCode == REQUEST_STORAGE_WRITE) {
+            if (granted) onInstallClicked();
+            else toast(R.string.toast_permission_denied);
+        }
+    }
+
+    private void onInstallClicked() {
+        final BundleLoader.Loaded l = loaded;
+        if (l == null || busy) return;
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !getPackageManager().canRequestPackageInstalls()) {
+            showInstallPermissionDialog();
+            return;
+        }
+        if (l.hasObb && !hasObbAccess()) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                showAllFilesDialog();
+            } else {
+                requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, REQUEST_STORAGE_WRITE);
+            }
+            return;
+        }
+
+        final List<ApkEntry> selected = SplitSelector.checkedEntries(l.entries);
+        if (selected.isEmpty() || SplitSelector.selectedBase(l.entries) == null) {
+            toast(R.string.toast_no_selection);
+            return;
+        }
+
+        final ApkEntry base = SplitSelector.selectedBase(l.entries);
+        final File dir = jobDir;
+        final CancelToken currentToken = token;
+        lastReportKey = null;
+        sessionId = -1;
+        InstallEvents.discardPending();
+        setBusy(true);
+        awaitingResult = true;
+        setBackBlocked(true);
+
+        worker.execute(() -> {
+            try {
+                InstallPipeline.Prepared prepared = InstallPipeline.prepare(getApplicationContext(), l.source, dir, selected, base, reporter, currentToken);
+                reporter.progress(0);
+                reporter.status(R.string.status_writing, 0);
+                final int[] last = {-1};
+                int id = ApkInstaller.commit(getApplicationContext(), prepared.files, prepared.base, prepared.packageName, percent -> {
+                    currentToken.check();
+                    if (percent != last[0]) {
+                        last[0] = percent;
+                        reporter.status(R.string.status_writing, percent);
+                        reporter.progress(percent);
+                    }
+                });
+                ui(() -> {
+                    sessionId = id;
+                    if (!awaitingResult) return;
+                    reporter.progress(-1);
+                    tvStatus.setText(R.string.status_waiting);
+                });
+            } catch (UserException e) {
+                ui(() -> onInstallFailed(getString(R.string.status_failure, getString(e.resId, e.args))));
+            } catch (InterruptedIOException e) {
+                ui(() -> onInstallFailed(getString(R.string.status_cancelled)));
+            } catch (IOException | RuntimeException e) {
+                ui(() -> onInstallFailed(getString(R.string.status_failure, getString(R.string.error_session, String.valueOf(e.getMessage())))));
+            }
+        });
+    }
+
+    @Override
+    public void onInstallEvent(InstallEvents.Event event) {
+        ui(() -> handleEvent(event));
+    }
+
+    private void handleEvent(InstallEvents.Event event) {
+        if (!awaitingResult) return;
+        if (sessionId != -1 && event.sessionId != -1 && event.sessionId != sessionId) return;
+
+        switch (event.status) {
+            case android.content.pm.PackageInstaller.STATUS_PENDING_USER_ACTION:
+                tvStatus.setText(R.string.status_waiting);
+                if (event.confirmIntent != null) {
+                    try {
+                        event.confirmIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                        startActivity(event.confirmIntent);
+                    } catch (RuntimeException e) {
+                        onInstallFailed(getString(R.string.status_failure, String.valueOf(e.getMessage())));
+                    }
+                }
+                break;
+            case android.content.pm.PackageInstaller.STATUS_SUCCESS:
+                onInstallSucceeded();
+                break;
+            default:
+                onInstallFailed(getString(R.string.status_failure, failureText(event.status, event.message)));
+                break;
+        }
+    }
+
+    private String failureText(int status, String message) {
+        String text;
+        switch (status) {
+            case android.content.pm.PackageInstaller.STATUS_FAILURE_ABORTED:
+                text = getString(R.string.fail_aborted);
+                break;
+            case android.content.pm.PackageInstaller.STATUS_FAILURE_BLOCKED:
+                text = getString(R.string.fail_blocked);
+                break;
+            case android.content.pm.PackageInstaller.STATUS_FAILURE_CONFLICT:
+                text = getString(R.string.fail_conflict);
+                break;
+            case android.content.pm.PackageInstaller.STATUS_FAILURE_INCOMPATIBLE:
+                text = getString(R.string.fail_incompatible);
+                break;
+            case android.content.pm.PackageInstaller.STATUS_FAILURE_INVALID:
+                text = getString(R.string.fail_invalid);
+                break;
+            case android.content.pm.PackageInstaller.STATUS_FAILURE_STORAGE:
+                text = getString(R.string.fail_storage);
+                break;
+            default:
+                text = getString(R.string.fail_unknown, status);
+                break;
+        }
+        if (message != null && !message.trim().isEmpty()) text = text + "\n" + message.trim();
+        return text;
+    }
+
+    private void onInstallFailed(String text) {
+        awaitingResult = false;
+        setBackBlocked(false);
+        setBusy(false);
+        tvStatus.setText(text);
+    }
+
+    private void onInstallSucceeded() {
+        awaitingResult = false;
+        final BundleLoader.Loaded l = loaded;
+        if (l == null || !l.hasObb) {
+            finishSuccess(null);
+            return;
+        }
+
+        obbRunning = true;
+        setBusy(true);
+        progress.setIndeterminate(false);
+        progress.setProgress(0);
+        lastReportKey = null;
+        final long total = obbTotal(l);
+        final String packageName = l.app.packageName;
+        final CancelToken currentToken = token;
+
+        worker.execute(() -> {
+            String error = null;
+            try {
+                final int[] last = {-1};
+                ObbInstaller.install(l.source, l.obbEntries, packageName, done -> {
+                    currentToken.check();
+                    int percent = total > 0 ? (int) Math.min(100L, done * 100L / total) : 0;
+                    if (percent != last[0]) {
+                        last[0] = percent;
+                        reporter.status(R.string.status_obb, percent);
+                        reporter.progress(percent);
+                    }
+                });
+            } catch (IOException | RuntimeException e) {
+                error = String.valueOf(e.getMessage());
+            }
+            final String result = error;
+            ui(() -> finishSuccess(result));
+        });
+    }
+
+    private long obbTotal(BundleLoader.Loaded l) {
+        long total = 0L;
+        try (java.util.zip.ZipFile zip = new java.util.zip.ZipFile(l.source)) {
+            for (String name : l.obbEntries) {
+                java.util.zip.ZipEntry entry = zip.getEntry(name);
+                if (entry != null && entry.getSize() > 0) total += entry.getSize();
+            }
+        } catch (IOException ignored) {
+        }
+        return total;
+    }
+
+    private void finishSuccess(String obbError) {
+        obbRunning = false;
+        installed = true;
+        setBackBlocked(false);
+        setBusy(false);
+        btnInstall.setEnabled(false);
+        btnSelectSplits.setVisibility(View.GONE);
+        tvStatus.setText(obbError == null ? getString(R.string.status_success) : getString(R.string.status_success_obb_failed, obbError));
+
+        BundleLoader.Loaded l = loaded;
+        if (l != null && getPackageManager().getLaunchIntentForPackage(l.app.packageName) != null) {
+            btnOpen.setVisibility(View.VISIBLE);
+        }
+        deleteJobAsync();
+    }
+
+    private void openInstalledApp() {
+        BundleLoader.Loaded l = loaded;
+        if (l == null) return;
+        Intent launch = getPackageManager().getLaunchIntentForPackage(l.app.packageName);
+        if (launch == null) return;
+        try {
+            startActivity(launch);
+        } catch (RuntimeException e) {
+            toast(R.string.toast_unsupported);
+        }
+    }
+
 }
