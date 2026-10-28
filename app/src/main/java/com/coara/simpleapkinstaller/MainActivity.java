@@ -5,6 +5,7 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
 import android.content.Intent;
+import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Build;
@@ -59,6 +60,8 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
     private TextView tvSize;
     private TextView tvStatus;
     private ProgressBar progress;
+    private ProgressBar spinner;
+    private TextView tvStep;
 
     private ExecutorService worker;
     private CancelToken token = new CancelToken();
@@ -68,13 +71,15 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
 
     private volatile boolean busy;
     private volatile boolean awaitingResult;
-    private volatile boolean commitStarted;
-    private volatile boolean systemProgressReceived;
-    private volatile int sessionId = -1;
-    private int systemProgressPercent;
+    private volatile boolean committed;
+    private boolean confirmPending;
+    private boolean confirmShown;
+    private int stepTotal = 3;
+    private PackageInstaller.SessionCallback sessionCallback;
     private boolean obbRunning;
     private boolean installed;
     private boolean installPromptShown;
+    private int sessionId = -1;
     private Object lastReportKey;
 
     private BackGuard backGuard;
@@ -123,6 +128,8 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
         tvSize = findViewById(R.id.tv_size);
         tvStatus = findViewById(R.id.tv_status);
         progress = findViewById(R.id.progress);
+        spinner = findViewById(R.id.spinner);
+        tvStep = findViewById(R.id.tv_step);
 
         btnSelect.setOnClickListener(this);
         btnSelectSplits.setOnClickListener(this);
@@ -192,8 +199,86 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
         handleIntent(intent);
     }
 
+    private void registerSessionCallback() {
+        if (sessionCallback != null) return;
+        sessionCallback = new PackageInstaller.SessionCallback() {
+            @Override
+            public void onCreated(int id) {
+                if (awaitingResult && sessionId == -1 && !committed) sessionId = id;
+            }
+
+            @Override
+            public void onBadgingChanged(int id) {
+            }
+
+            @Override
+            public void onActiveChanged(int id, boolean active) {
+            }
+
+            @Override
+            public void onProgressChanged(int id, float value) {
+                if (!awaitingResult || !committed) return;
+                if (sessionId != -1 && id != sessionId) return;
+                showSystemProgress(value);
+            }
+
+            @Override
+            public void onFinished(int id, boolean success) {
+            }
+        };
+        getPackageManager().getPackageInstaller().registerSessionCallback(sessionCallback);
+    }
+
+    private void setStep(int index, int labelRes) {
+        tvStep.setText(getString(R.string.step_line, index, stepTotal, getString(labelRes)));
+        tvStep.setVisibility(View.VISIBLE);
+    }
+
+    private void setBar(int percent) {
+        progress.setVisibility(View.VISIBLE);
+        progress.setIndeterminate(false);
+        progress.setProgress(Math.max(0, Math.min(100, percent)));
+    }
+
+    private void showSystemProgress(float value) {
+        boolean installing = value >= 0.89f;
+        if (confirmPending) {
+            if (!installing) return;
+            confirmPending = false;
+            confirmShown = false;
+        }
+        int percent = Math.round(Math.max(0f, Math.min(1f, (value - 0.8f) / 0.2f)) * 100f);
+        setStep(3, installing ? R.string.step_install : R.string.step_verify);
+        setBar(percent);
+        spinner.setVisibility(View.VISIBLE);
+        tvStatus.setText(getString(R.string.status_installing, percent));
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (awaitingResult && committed && confirmPending && confirmShown) {
+            confirmPending = false;
+            confirmShown = false;
+            setStep(3, R.string.step_verify);
+            setBar(0);
+            spinner.setVisibility(View.VISIBLE);
+            tvStatus.setText(getString(R.string.status_installing, 0));
+        }
+    }
+
+    private void unregisterSessionCallback() {
+        if (sessionCallback == null) return;
+        try {
+            getPackageManager().getPackageInstaller().unregisterSessionCallback(sessionCallback);
+        } catch (RuntimeException ignored) {
+        }
+        sessionCallback = null;
+    }
+
     @Override
     protected void onDestroy() {
+        unregisterSessionCallback();
         token.cancel();
         worker.shutdownNow();
         setBackBlocked(false);
@@ -241,6 +326,8 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
         btnInstall.setEnabled(!value && loaded != null && !installed);
         btnOpen.setEnabled(!value);
         progress.setVisibility(value ? View.VISIBLE : View.GONE);
+        spinner.setVisibility(View.GONE);
+        tvStep.setVisibility(View.GONE);
         if (value) progress.setIndeterminate(true);
         if (value) {
             getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
@@ -638,66 +725,40 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
         final CancelToken currentToken = token;
         lastReportKey = null;
         sessionId = -1;
-        commitStarted = false;
-        systemProgressReceived = false;
-        systemProgressPercent = 0;
         InstallEvents.discardPending();
         setBusy(true);
+        committed = false;
+        confirmPending = false;
+        confirmShown = false;
+        stepTotal = l.hasObb ? 4 : 3;
         awaitingResult = true;
         setBackBlocked(true);
+        registerSessionCallback();
+        setStep(1, R.string.step_prepare);
 
         worker.execute(() -> {
             try {
                 InstallPipeline.Prepared prepared = InstallPipeline.prepare(getApplicationContext(), l.source, dir, selected, base, reporter, currentToken);
-                reporter.progress(0);
+                ui(() -> {
+                    if (!awaitingResult) return;
+                    setStep(2, R.string.step_transfer);
+                    setBar(0);
+                });
                 reporter.status(R.string.status_writing, 0);
                 final int[] last = {-1};
-                ApkInstaller.commit(getApplicationContext(), prepared.files, prepared.base, prepared.packageName, new ApkInstaller.Progress() {
-                    @Override
-                    public void onProgress(int percent) throws IOException {
-                        currentToken.check();
-                        if (percent != last[0]) {
-                            last[0] = percent;
-                            reporter.status(R.string.status_writing, percent);
-                            reporter.progress(percent);
-                        }
+                int id = ApkInstaller.commit(getApplicationContext(), prepared.files, prepared.base, prepared.packageName, percent -> {
+                    currentToken.check();
+                    if (percent != last[0]) {
+                        last[0] = percent;
+                        reporter.status(R.string.status_writing, percent);
+                        reporter.progress(percent);
                     }
-
-                    @Override
-                    public void onCommitStarted(int id) {
-                        sessionId = id;
-                        systemProgressReceived = false;
-                        systemProgressPercent = 0;
-                        commitStarted = true;
-                        ui(() -> {
-                            if (!awaitingResult || sessionId != id) return;
-                            progress.setIndeterminate(true);
-                            progress.setProgress(0);
-                            tvStatus.setText(R.string.status_waiting);
-                        });
-                    }
-
-                    @Override
-                    public void onInstallerProgress(int id, int percent) {
-                        ui(() -> {
-                            if (!awaitingResult || !commitStarted || sessionId != id) return;
-                            systemProgressReceived = true;
-                            systemProgressPercent = Math.max(0, Math.min(100, percent));
-                            progress.setIndeterminate(false);
-                            progress.setProgress(systemProgressPercent);
-                            tvStatus.setText(getString(R.string.status_system_installing, systemProgressPercent));
-                        });
-                    }
-
-                    @Override
-                    public void onInstallerActive(int id, boolean active) {
-                        if (!active) return;
-                        ui(() -> {
-                            if (!awaitingResult || !commitStarted || sessionId != id || systemProgressReceived) return;
-                            progress.setIndeterminate(true);
-                            tvStatus.setText(R.string.status_system_processing);
-                        });
-                    }
+                });
+                committed = true;
+                ui(() -> {
+                    sessionId = id;
+                    if (!awaitingResult || confirmPending) return;
+                    showSystemProgress(0.8f);
                 });
             } catch (UserException e) {
                 ui(() -> onInstallFailed(getString(R.string.status_failure, getString(e.resId, e.args))));
@@ -720,12 +781,16 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
 
         switch (event.status) {
             case android.content.pm.PackageInstaller.STATUS_PENDING_USER_ACTION:
-                progress.setIndeterminate(true);
-                tvStatus.setText(R.string.status_user_action);
+                confirmPending = true;
+                setStep(3, R.string.step_confirm);
+                setBar(0);
+                spinner.setVisibility(View.GONE);
+                tvStatus.setText("");
                 if (event.confirmIntent != null) {
                     try {
                         event.confirmIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                         startActivity(event.confirmIntent);
+                        confirmShown = true;
                     } catch (RuntimeException e) {
                         onInstallFailed(getString(R.string.status_failure, String.valueOf(e.getMessage())));
                     }
@@ -771,7 +836,10 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
 
     private void onInstallFailed(String text) {
         awaitingResult = false;
-        commitStarted = false;
+        committed = false;
+        confirmPending = false;
+        confirmShown = false;
+        unregisterSessionCallback();
         setBackBlocked(false);
         setBusy(false);
         tvStatus.setText(text);
@@ -779,7 +847,10 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
 
     private void onInstallSucceeded() {
         awaitingResult = false;
-        commitStarted = false;
+        committed = false;
+        confirmPending = false;
+        confirmShown = false;
+        unregisterSessionCallback();
         final BundleLoader.Loaded l = loaded;
         if (l == null || !l.hasObb) {
             finishSuccess(null);
@@ -788,8 +859,8 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
 
         obbRunning = true;
         setBusy(true);
-        progress.setIndeterminate(false);
-        progress.setProgress(0);
+        setStep(4, R.string.step_obb);
+        setBar(0);
         lastReportKey = null;
         final long total = obbTotal(l);
         final String packageName = l.app.packageName;
