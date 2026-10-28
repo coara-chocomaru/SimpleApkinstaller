@@ -76,6 +76,8 @@
 
     <string name="permission_install_title">許可が必要です</string>
     <string name="permission_install_message">システム設定で、このアプリに「不明なアプリのインストール」を許可してください。</string>
+    <string name="permission_select_files_title">すべてのファイルへのアクセスが必要です</string>
+    <string name="permission_select_files_message">APKの選択と処理を行うには「すべてのファイルへのアクセス」を許可してください。許可しない場合、アプリを終了します。</string>
     <string name="permission_files_title">全ファイルアクセスが必要です</string>
     <string name="permission_files_message">OBBを配置するには全ファイルへのアクセスが必要です。システム設定で許可してください。</string>
     <string name="error_settings">設定画面を開けませんでした。</string>
