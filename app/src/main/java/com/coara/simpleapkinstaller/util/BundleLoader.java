@@ -3,6 +3,7 @@ package com.coara.simpleapkinstaller.util;
 import android.content.Context;
 import android.content.pm.PackageInfo;
 import android.net.Uri;
+import android.os.ParcelFileDescriptor;
 
 import com.coara.simpleapkinstaller.R;
 import com.coara.simpleapkinstaller.model.ApkEntry;
@@ -16,6 +17,7 @@ import java.io.InterruptedIOException;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 public final class BundleLoader {
@@ -23,6 +25,7 @@ public final class BundleLoader {
 
     public static final class Loaded {
         public File source;
+        public ParcelFileDescriptor sourceDescriptor;
         public String fileName;
         public ArchiveKind kind = ArchiveKind.APK;
         public ArchiveMetadata metadata = new ArchiveMetadata();
@@ -34,12 +37,27 @@ public final class BundleLoader {
         public String installedVersionName;
         public long installedVersionCode = -1L;
         public DeviceProfile profile;
+
+        public synchronized void closeSource() {
+            ParcelFileDescriptor descriptor = sourceDescriptor;
+            sourceDescriptor = null;
+            if (descriptor != null) {
+                try {
+                    descriptor.close();
+                } catch (IOException ignored) {
+                } finally {
+                    source = null;
+                }
+            }
+        }
     }
 
     private BundleLoader() {}
 
     public static Loaded load(Context context, Uri uri, File jobDir, Reporter reporter, CancelToken token) throws UserException {
         try {
+            Loaded direct = tryLoadDirectApk(context, uri, reporter, token);
+            if (direct != null) return direct;
             return loadInternal(context, uri, jobDir, reporter, token);
         } catch (InterruptedIOException e) {
             throw new UserException(R.string.status_cancelled);
@@ -49,6 +67,75 @@ public final class BundleLoader {
             String message = String.valueOf(e.getMessage());
             boolean denied = "file".equals(uri.getScheme()) && (message.contains("EACCES") || message.contains("Permission denied"));
             throw new UserException(denied, R.string.error_read, message);
+        }
+    }
+
+
+    private static Loaded tryLoadDirectApk(Context context, Uri uri, Reporter reporter, CancelToken token) throws InterruptedIOException {
+        ParcelFileDescriptor descriptor = null;
+        try {
+            token.check();
+            File source;
+            String scheme = uri.getScheme();
+            String name = FileUtils.displayName(context, uri);
+            if ("file".equalsIgnoreCase(scheme)) {
+                String path = uri.getPath();
+                if (path == null) return null;
+                File original = new File(path);
+                if (!original.isFile() || !original.canRead()) return null;
+                descriptor = ParcelFileDescriptor.open(original, ParcelFileDescriptor.MODE_READ_ONLY);
+                source = new File("/proc/self/fd/" + descriptor.getFd());
+            } else if ("content".equalsIgnoreCase(scheme)) {
+                String lowerName = name == null ? "" : name.toLowerCase(Locale.ROOT);
+                String mime = context.getContentResolver().getType(uri);
+                if (!lowerName.endsWith(".apk") && !"application/vnd.android.package-archive".equalsIgnoreCase(mime)) return null;
+                descriptor = context.getContentResolver().openFileDescriptor(uri, "r");
+                if (descriptor == null) return null;
+                source = new File("/proc/self/fd/" + descriptor.getFd());
+            } else {
+                return null;
+            }
+
+            if (!source.isFile() || !source.canRead() || !ArchiveInspector.isApk(source)) return null;
+            long size = source.length();
+            if (size <= 0L) return null;
+
+            if (name == null || name.trim().isEmpty()) name = "selected.apk";
+
+            Loaded loaded = new Loaded();
+            loaded.source = source;
+            loaded.fileName = name;
+            loaded.kind = ArchiveKind.APK;
+            loaded.profile = PackageUtils.deviceProfile(context);
+
+            ApkEntry entry = new ApkEntry(name, name, size, "", "", SplitCategory.BASE);
+            entry.file = source;
+            entry.checked = true;
+            loaded.entries.add(entry);
+            loaded.baseEntry = entry;
+
+            reporter.progress(-1);
+            reporter.status(R.string.status_analyzing);
+            try {
+                refreshApp(context, loaded);
+            } catch (UserException e) {
+                return null;
+            }
+            token.check();
+            loaded.sourceDescriptor = descriptor;
+            descriptor = null;
+            return loaded;
+        } catch (InterruptedIOException e) {
+            throw e;
+        } catch (IOException | RuntimeException e) {
+            return null;
+        } finally {
+            if (descriptor != null) {
+                try {
+                    descriptor.close();
+                } catch (IOException ignored) {
+                }
+            }
         }
     }
 
