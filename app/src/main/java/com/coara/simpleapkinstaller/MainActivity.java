@@ -24,12 +24,14 @@ import android.widget.Toast;
 import com.coara.simpleapkinstaller.install.ApkInstaller;
 import com.coara.simpleapkinstaller.install.InstallEvents;
 import com.coara.simpleapkinstaller.install.InstallPipeline;
+import com.coara.simpleapkinstaller.install.InstallStateStore;
 import com.coara.simpleapkinstaller.model.ApkEntry;
 import com.coara.simpleapkinstaller.util.BackGuard;
 import com.coara.simpleapkinstaller.util.BundleLoader;
 import com.coara.simpleapkinstaller.util.CancelToken;
 import com.coara.simpleapkinstaller.util.FileUtils;
 import com.coara.simpleapkinstaller.util.ObbInstaller;
+import com.coara.simpleapkinstaller.util.PackageUtils;
 import com.coara.simpleapkinstaller.util.Reporter;
 import com.coara.simpleapkinstaller.util.SplitSelector;
 import com.coara.simpleapkinstaller.util.UserException;
@@ -72,15 +74,22 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
     private volatile boolean busy;
     private volatile boolean awaitingResult;
     private volatile boolean committed;
+    private volatile boolean commitInProgress;
+    private volatile boolean activityDestroyed;
     private boolean confirmPending;
     private boolean confirmShown;
+    private int pendingUserActionSessionId = -1;
     private int stepTotal = 3;
     private PackageInstaller.SessionCallback sessionCallback;
-    private boolean obbRunning;
+    private volatile boolean obbRunning;
+    private volatile boolean installPreparing;
+    private volatile int lastTransferProgress;
+    private boolean resumeObbInstall;
     private boolean installed;
     private boolean installPromptShown;
-    private int sessionId = -1;
+    private volatile int sessionId = -1;
     private int lastSystemProgress;
+    private volatile boolean systemSessionFinished;
     private Object lastReportKey;
 
     private BackGuard backGuard;
@@ -101,12 +110,20 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
 
         @Override
         public void progress(int percent) {
+            if (installPreparing) {
+                ui(() -> {
+                    progress.setVisibility(View.VISIBLE);
+                    progress.setIndeterminate(true);
+                });
+                return;
+            }
             ui(() -> {
+                progress.setVisibility(View.VISIBLE);
                 if (percent < 0) {
                     progress.setIndeterminate(true);
                 } else {
                     progress.setIndeterminate(false);
-                    progress.setProgress(percent);
+                    progress.setProgress(Math.max(0, Math.min(100, percent)));
                 }
             });
         }
@@ -144,11 +161,143 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
 
         worker = Executors.newSingleThreadExecutor();
 
-        if (savedInstanceState == null) {
-            clearStaleJobs();
-            requestInstallPermissionIfNeeded();
-            handleIntent(getIntent());
+        boolean restored = restorePendingInstall();
+        clearStaleJobs(restored ? jobDir : null);
+        if (!restored) requestInstallPermissionIfNeeded();
+        if (!restored) handleIntent(getIntent());
+        if (resumeObbInstall && loaded != null) startObbInstall(loaded);
+    }
+
+    private boolean restorePendingInstall() {
+        InstallStateStore.State state = InstallStateStore.read(this);
+        if (state == null || state.sessionId < 0) return false;
+        File dir = state.jobDir;
+        if (dir == null) return false;
+        if (InstallStateStore.PHASE_TRANSFER.equals(state.phase) && !InstallStateStore.isActiveJob(dir)) {
+            try {
+                getPackageManager().getPackageInstaller().abandonSession(state.sessionId);
+            } catch (RuntimeException ignored) {
+            }
+            InstallStateStore.clear(this);
+            InstallStateStore.clearActiveJob(dir);
+            FileUtils.deleteRecursive(dir);
+            return false;
         }
+        if (InstallStateStore.PHASE_COMMITTING.equals(state.phase) && !InstallStateStore.isActiveJob(dir)) {
+            PackageInstaller.SessionInfo info = null;
+            try {
+                info = getPackageManager().getPackageInstaller().getSessionInfo(state.sessionId);
+            } catch (RuntimeException ignored) {
+            }
+            boolean commitSubmitted = state.pendingEvent != null || info == null;
+            if (!commitSubmitted && info != null) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) commitSubmitted = info.isSealed();
+                else commitSubmitted = info.isActive();
+            }
+            if (!commitSubmitted) {
+                try {
+                    getPackageManager().getPackageInstaller().abandonSession(state.sessionId);
+                } catch (RuntimeException ignored) {
+                }
+                InstallStateStore.clear(this);
+                InstallStateStore.clearActiveJob(dir);
+                FileUtils.deleteRecursive(dir);
+                return false;
+            }
+            InstallStateStore.setPhase(this, InstallStateStore.PHASE_INSTALL);
+            state.phase = InstallStateStore.PHASE_INSTALL;
+        }
+        if (InstallStateStore.PHASE_INSTALL.equals(state.phase) && !InstallStateStore.isActiveJob(dir)) {
+            PackageInstaller.SessionInfo info = null;
+            try {
+                info = getPackageManager().getPackageInstaller().getSessionInfo(state.sessionId);
+            } catch (RuntimeException ignored) {
+            }
+            boolean commitSubmitted = state.pendingEvent != null || info == null;
+            if (info != null) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) commitSubmitted = info.isSealed();
+                else commitSubmitted = info.isActive();
+            }
+            if (!commitSubmitted && state.pendingEvent == null) {
+                try {
+                    getPackageManager().getPackageInstaller().abandonSession(state.sessionId);
+                } catch (RuntimeException ignored) {
+                }
+                InstallStateStore.clear(this);
+                InstallStateStore.clearActiveJob(dir);
+                FileUtils.deleteRecursive(dir);
+                return false;
+            }
+            if (!state.hasObb) {
+                FileUtils.deleteRecursive(dir);
+                InstallStateStore.clearActiveJob(dir);
+            } else if (dir.isDirectory()) {
+                File[] children = dir.listFiles();
+                if (children != null) {
+                    for (File child : children) {
+                        if (!"source.bin".equals(child.getName())) FileUtils.deleteRecursive(child);
+                    }
+                }
+            }
+        }
+        jobDir = dir;
+        sessionId = state.sessionId;
+        committed = InstallStateStore.PHASE_INSTALL.equals(state.phase);
+        commitInProgress = InstallStateStore.PHASE_TRANSFER.equals(state.phase)
+                || InstallStateStore.PHASE_COMMITTING.equals(state.phase);
+        lastSystemProgress = InstallStateStore.PHASE_TRANSFER.equals(state.phase) ? 0 : 50;
+        lastTransferProgress = 0;
+        installPreparing = false;
+        systemSessionFinished = false;
+        loaded = new BundleLoader.Loaded();
+        loaded.source = new File(dir, "source.bin");
+        loaded.fileName = loaded.source.getName();
+        loaded.hasObb = state.hasObb;
+        stepTotal = state.hasObb ? 4 : 3;
+        loaded.obbEntries = new java.util.ArrayList<>(state.obbEntries);
+        loaded.app = new PackageUtils.AppInfo();
+        loaded.app.packageName = state.packageName == null ? "" : state.packageName;
+        loaded.app.label = loaded.app.packageName;
+        if (InstallStateStore.PHASE_OBB_DONE.equals(state.phase)) {
+            committed = false;
+            awaitingResult = false;
+            obbRunning = false;
+            resumeObbInstall = false;
+            finishSuccess(state.obbError);
+            return true;
+        }
+        if (InstallStateStore.PHASE_OBB.equals(state.phase)) {
+            committed = false;
+            awaitingResult = false;
+            obbRunning = false;
+            resumeObbInstall = true;
+            return true;
+        }
+        awaitingResult = true;
+        resumeObbInstall = false;
+        setBusy(true);
+        setBackBlocked(true);
+        if (InstallStateStore.PHASE_TRANSFER.equals(state.phase)) {
+            setStep(2, R.string.step_transfer);
+            setBar(0);
+            spinner.setVisibility(View.VISIBLE);
+            tvStatus.setText(getString(R.string.status_writing, 0));
+        } else {
+            setStep(3, R.string.step_install);
+            setBar(50);
+            spinner.setVisibility(View.VISIBLE);
+            tvStatus.setText(getString(R.string.status_installing, 50));
+        }
+        registerSessionCallback();
+        try {
+            PackageInstaller.SessionInfo info = getPackageManager().getPackageInstaller().getSessionInfo(sessionId);
+            if (info != null) {
+                if (InstallStateStore.PHASE_TRANSFER.equals(state.phase)) showTransferProgress(info.getProgress());
+                else showSystemProgress(info.getProgress());
+            }
+        } catch (RuntimeException ignored) {
+        }
+        return true;
     }
 
     @SuppressWarnings("deprecation")
@@ -172,12 +321,30 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
         view.setPadding(left, top, right, bottom);
     }
 
-    private void clearStaleJobs() {
+    private void clearStaleJobs(File preserveDir) {
         File cache = getCacheDir();
+        if (preserveDir == null) {
+            String activePath = InstallStateStore.getActiveJobPath();
+            if (activePath != null) preserveDir = new File(activePath);
+            else {
+                InstallStateStore.State state = InstallStateStore.read(this);
+                if (state != null) preserveDir = state.jobDir;
+            }
+        }
         File[] children = cache.listFiles();
         if (children == null) return;
+        String preservePath = null;
+        try {
+            if (preserveDir != null) preservePath = preserveDir.getCanonicalPath();
+        } catch (IOException ignored) {
+        }
         for (File child : children) {
-            if (child.getName().startsWith(JOB_PREFIX)) FileUtils.deleteRecursive(child);
+            if (!child.getName().startsWith(JOB_PREFIX)) continue;
+            try {
+                if (preservePath != null && preservePath.equals(child.getCanonicalPath())) continue;
+            } catch (IOException ignored) {
+            }
+            FileUtils.deleteRecursive(child);
         }
     }
 
@@ -185,6 +352,12 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
     protected void onStart() {
         super.onStart();
         InstallEvents.attach(this);
+        InstallStateStore.State state = InstallStateStore.read(this);
+        if (state != null && InstallStateStore.PHASE_OBB_DONE.equals(state.phase)) {
+            finishSuccess(state.obbError);
+            return;
+        }
+        if (state != null && state.pendingEvent != null) onInstallEvent(state.pendingEvent);
     }
 
     @Override
@@ -218,15 +391,29 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
 
             @Override
             public void onProgressChanged(int id, float value) {
-                if (!awaitingResult || !committed) return;
+                if (activityDestroyed || isFinishing() || !awaitingResult) return;
                 if (sessionId != -1 && id != sessionId) return;
+                InstallStateStore.State state = InstallStateStore.read(MainActivity.this);
+                if (state == null) return;
+                if (InstallStateStore.PHASE_TRANSFER.equals(state.phase)) {
+                    showTransferProgress(value);
+                    return;
+                }
+                if (InstallStateStore.PHASE_COMMITTING.equals(state.phase)) {
+                    commitInProgress = true;
+                    showSystemProgress(value);
+                    return;
+                }
+                committed = true;
+                commitInProgress = false;
                 showSystemProgress(value);
             }
 
             @Override
             public void onFinished(int id, boolean success) {
-                if (!success || !awaitingResult || !committed) return;
+                if (activityDestroyed || isFinishing() || !success || !awaitingResult || (!committed && !commitInProgress)) return;
                 if (sessionId != -1 && id != sessionId) return;
+                systemSessionFinished = true;
                 BundleLoader.Loaded current = loaded;
                 if (current == null || !current.hasObb) showSystemProgress(1f);
             }
@@ -245,16 +432,32 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
         progress.setProgress(Math.max(0, Math.min(100, percent)));
     }
 
+    private void showTransferProgress(float value) {
+        if (Float.isNaN(value) || Float.isInfinite(value)) return;
+        float clientPart = Math.max(0f, Math.min(1f, value / 0.8f));
+        int percent = Math.round(clientPart * 50f);
+        percent = Math.max(0, Math.min(50, percent));
+        percent = Math.max(lastTransferProgress, percent);
+        lastTransferProgress = percent;
+        setStep(2, R.string.step_transfer);
+        setBar(percent);
+        spinner.setVisibility(View.VISIBLE);
+        tvStatus.setText(getString(R.string.status_writing, percent));
+    }
+
     private void showSystemProgress(float value) {
         if (Float.isNaN(value) || Float.isInfinite(value)) return;
-        boolean installing = value >= 0.89f;
+        float overall = Math.max(0f, Math.min(1f, value));
+        boolean installing = overall >= 0.89f;
         if (confirmPending) {
             if (!installing) return;
             confirmPending = false;
             confirmShown = false;
         }
-        int percent = Math.round(Math.max(0f, Math.min(1f, value)) * 100f);
-        percent = Math.max(lastSystemProgress, percent);
+        float systemPart = Math.max(0f, Math.min(1f, (overall - 0.8f) / 0.2f));
+        int percent = 50 + Math.round(systemPart * 50f);
+        if (!systemSessionFinished && percent >= 100) percent = 99;
+        percent = Math.max(lastSystemProgress, Math.min(100, percent));
         lastSystemProgress = percent;
         setStep(3, R.string.step_install);
         setBar(percent);
@@ -268,7 +471,7 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
         if (awaitingResult && committed && confirmPending && confirmShown) {
             confirmPending = false;
             confirmShown = false;
-            showSystemProgress(Math.max(0.8f, lastSystemProgress / 100f));
+            showSystemProgress(0.8f);
         }
     }
 
@@ -283,11 +486,25 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
 
     @Override
     protected void onDestroy() {
+        activityDestroyed = true;
         unregisterSessionCallback();
-        token.cancel();
-        worker.shutdownNow();
+        boolean keepWorking;
+        synchronized (this) {
+            keepWorking = committed || commitInProgress || obbRunning;
+            if (!keepWorking) {
+                awaitingResult = false;
+                token.cancel();
+            }
+        }
+        if (keepWorking) {
+            worker.shutdown();
+            if (committed && !commitInProgress) closeLoadedSource();
+        } else {
+            closeLoadedSource();
+            worker.shutdownNow();
+            deleteJobAsync();
+        }
         setBackBlocked(false);
-        if (!awaitingResult && !obbRunning) deleteJobAsync();
         super.onDestroy();
     }
 
@@ -402,6 +619,7 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
     }
 
     private void resetUi() {
+        closeLoadedSource();
         loaded = null;
         installed = false;
         sessionId = -1;
@@ -416,9 +634,15 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
         btnInstall.setEnabled(false);
     }
 
+    private void closeLoadedSource() {
+        BundleLoader.Loaded current = loaded;
+        if (current != null) current.closeSource();
+    }
+
     private void deleteJobAsync() {
         final File dir = jobDir;
         jobDir = null;
+        InstallStateStore.clearActiveJob(dir);
         if (dir == null) return;
         Thread thread = new Thread(() -> FileUtils.deleteRecursive(dir), "cleanup");
         thread.setDaemon(true);
@@ -439,6 +663,7 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
 
         final File dir = new File(getCacheDir(), JOB_PREFIX + System.currentTimeMillis());
         jobDir = dir;
+        InstallStateStore.registerActiveJob(dir);
         pendingReadUri = null;
         setBusy(true);
         tvStatus.setText(R.string.status_analyzing);
@@ -446,11 +671,25 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
         worker.execute(() -> {
             try {
                 BundleLoader.Loaded result = BundleLoader.load(getApplicationContext(), uri, dir, reporter, currentToken);
-                ui(() -> onLoaded(result));
+                runOnUiThread(() -> {
+                    if (isDestroyed() || isFinishing()) {
+                        result.closeSource();
+                        FileUtils.deleteRecursive(dir);
+                    } else {
+                        onLoaded(result);
+                    }
+                });
             } catch (UserException e) {
-                ui(() -> onLoadFailed(e, uri));
+                runOnUiThread(() -> {
+                    if (isDestroyed() || isFinishing()) FileUtils.deleteRecursive(dir);
+                    else onLoadFailed(e, uri);
+                });
             } catch (RuntimeException e) {
-                ui(() -> onLoadFailed(new UserException(R.string.error_read, String.valueOf(e.getMessage())), uri));
+                UserException failure = new UserException(R.string.error_read, String.valueOf(e.getMessage()));
+                runOnUiThread(() -> {
+                    if (isDestroyed() || isFinishing()) FileUtils.deleteRecursive(dir);
+                    else onLoadFailed(failure, uri);
+                });
             }
         });
     }
@@ -730,10 +969,18 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
         final CancelToken currentToken = token;
         lastReportKey = null;
         sessionId = -1;
+        pendingUserActionSessionId = -1;
         lastSystemProgress = 0;
+        lastTransferProgress = 0;
+        systemSessionFinished = false;
+        installPreparing = true;
+        setBar(0);
+        progress.setIndeterminate(true);
+        InstallStateStore.clear(this);
         InstallEvents.discardPending();
         setBusy(true);
         committed = false;
+        commitInProgress = false;
         confirmPending = false;
         confirmShown = false;
         stepTotal = l.hasObb ? 4 : 3;
@@ -745,33 +992,73 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
         worker.execute(() -> {
             try {
                 InstallPipeline.Prepared prepared = InstallPipeline.prepare(getApplicationContext(), l.source, dir, selected, base, reporter, currentToken);
+                installPreparing = false;
+                lastTransferProgress = 0;
                 ui(() -> {
                     if (!awaitingResult) return;
                     setStep(2, R.string.step_transfer);
                     setBar(0);
+                    spinner.setVisibility(View.VISIBLE);
+                    tvStatus.setText(getString(R.string.status_writing, 0));
                 });
                 reporter.status(R.string.status_writing, 0);
                 final int[] last = {-1};
-                int id = ApkInstaller.commit(getApplicationContext(), prepared.files, prepared.base, prepared.packageName, percent -> {
+                currentToken.check();
+                synchronized (MainActivity.this) {
+                    currentToken.check();
+                    commitInProgress = true;
+                }
+                int id = ApkInstaller.commit(getApplicationContext(), prepared.files, prepared.base, prepared.packageName, dir, l.hasObb, l.obbEntries, percent -> {
                     currentToken.check();
                     if (percent != last[0]) {
                         last[0] = percent;
-                        reporter.status(R.string.status_writing, percent);
-                        reporter.progress(percent * 80 / 100);
+                        int mapped = percent * 50 / 100;
+                        lastTransferProgress = Math.max(lastTransferProgress, mapped);
+                        reporter.status(R.string.status_writing, lastTransferProgress);
+                        reporter.progress(lastTransferProgress);
                     }
                 });
-                committed = true;
-                ui(() -> {
+                synchronized (MainActivity.this) {
                     sessionId = id;
-                    if (!awaitingResult || confirmPending) return;
-                    showSystemProgress(0.8f);
+                    committed = true;
+                    commitInProgress = false;
+                }
+                if (activityDestroyed) closeLoadedSource();
+                InstallEvents.publishTransient(new InstallEvents.Event(id,
+                        InstallEvents.STATUS_COMMIT_ACCEPTED, null, prepared.packageName, null));
+                ui(() -> {
+                    if (!awaitingResult) return;
+                    InstallStateStore.State state = InstallStateStore.read(MainActivity.this);
+                    if (state != null && state.pendingEvent != null) {
+                        onInstallEvent(state.pendingEvent);
+                        return;
+                    }
+                    if (!confirmPending) showSystemProgress(0.8f);
                 });
             } catch (UserException e) {
-                ui(() -> onInstallFailed(getString(R.string.status_failure, getString(e.resId, e.args))));
+                installPreparing = false;
+                commitInProgress = false;
+                if (activityDestroyed) {
+                    closeLoadedSource();
+                    cleanupDestroyedJob(dir, getString(e.resId, e.args));
+                }
+                else ui(() -> onInstallFailed(getString(R.string.status_failure, getString(e.resId, e.args))));
             } catch (InterruptedIOException e) {
-                ui(() -> onInstallFailed(getString(R.string.status_cancelled)));
+                installPreparing = false;
+                commitInProgress = false;
+                if (activityDestroyed) {
+                    closeLoadedSource();
+                    cleanupDestroyedJob(dir, String.valueOf(e.getMessage()));
+                }
+                else ui(() -> onInstallFailed(getString(R.string.status_cancelled)));
             } catch (IOException | RuntimeException e) {
-                ui(() -> onInstallFailed(getString(R.string.status_failure, getString(R.string.error_session, String.valueOf(e.getMessage())))));
+                installPreparing = false;
+                commitInProgress = false;
+                if (activityDestroyed) {
+                    closeLoadedSource();
+                    cleanupDestroyedJob(dir, String.valueOf(e.getMessage()));
+                }
+                else ui(() -> onInstallFailed(getString(R.string.status_failure, getString(R.string.error_session, String.valueOf(e.getMessage())))));
             }
         });
     }
@@ -782,14 +1069,50 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
     }
 
     private void handleEvent(InstallEvents.Event event) {
-        if (!awaitingResult) return;
+        if (event.status == InstallEvents.STATUS_COMMIT_ACCEPTED) {
+            if (sessionId < 0 || event.sessionId != sessionId) return;
+            committed = true;
+            commitInProgress = false;
+            InstallStateStore.State accepted = InstallStateStore.read(this);
+            if (accepted != null && accepted.pendingEvent != null) handleEvent(accepted.pendingEvent);
+            else if (awaitingResult && !confirmPending) showSystemProgress(0.8f);
+            return;
+        }
+        if (event.status == InstallEvents.STATUS_OBB_FINISHED_SUCCESS
+                || event.status == InstallEvents.STATUS_OBB_FINISHED_FAILURE) {
+            if (sessionId >= 0 && event.sessionId >= 0 && sessionId != event.sessionId) return;
+            finishSuccess(event.status == InstallEvents.STATUS_OBB_FINISHED_FAILURE ? event.message : null);
+            return;
+        }
+        InstallStateStore.State stateBeforeEvent = InstallStateStore.read(this);
+        if (stateBeforeEvent != null && InstallStateStore.PHASE_OBB.equals(stateBeforeEvent.phase)
+                && event.sessionId == stateBeforeEvent.sessionId) return;
+        if (!awaitingResult) {
+            InstallStateStore.State stored = InstallStateStore.read(this);
+            if (stored == null || stored.sessionId < 0 || stored.sessionId != event.sessionId) return;
+            if (!restorePendingInstall()) return;
+        }
+        if (!committed) {
+            InstallStateStore.State current = InstallStateStore.read(this);
+            if (current != null && (event.sessionId < 0 || current.sessionId == event.sessionId)) {
+                InstallStateStore.recordEvent(this, event);
+            } else if (sessionId >= 0 && event.sessionId == sessionId) {
+                String message = event.message == null || event.message.trim().isEmpty()
+                        ? getString(R.string.error_session, "Installation session ended") : event.message;
+                onInstallFailed(getString(R.string.status_failure, message));
+            }
+            return;
+        }
         if (sessionId != -1 && event.sessionId != -1 && event.sessionId != sessionId) return;
+        InstallStateStore.clearPendingEvent(this);
 
         switch (event.status) {
             case android.content.pm.PackageInstaller.STATUS_PENDING_USER_ACTION:
+                if (pendingUserActionSessionId == event.sessionId) break;
+                pendingUserActionSessionId = event.sessionId;
                 confirmPending = true;
                 setStep(3, R.string.step_confirm);
-                lastSystemProgress = Math.max(lastSystemProgress, 80);
+                lastSystemProgress = Math.max(lastSystemProgress, 50);
                 setBar(lastSystemProgress);
                 spinner.setVisibility(View.GONE);
                 tvStatus.setText("");
@@ -842,13 +1165,25 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
     }
 
     private void onInstallFailed(String text) {
+        installPreparing = false;
+        progress.setIndeterminate(false);
         awaitingResult = false;
         committed = false;
+        commitInProgress = false;
         confirmPending = false;
         confirmShown = false;
         unregisterSessionCallback();
+        InstallStateStore.clear(this);
         setBackBlocked(false);
         setBusy(false);
+        if (loaded != null && ((loaded.source == null || !loaded.source.isFile()) || loaded.entries.isEmpty())) {
+            closeLoadedSource();
+            loaded = null;
+            deleteJobAsync();
+            btnInstall.setEnabled(false);
+            btnSelectSplits.setVisibility(View.GONE);
+            btnOpen.setVisibility(View.GONE);
+        }
         tvStatus.setText(text);
     }
 
@@ -863,11 +1198,37 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
             finishSuccess(null);
             return;
         }
+        InstallStateStore.clearPendingEvent(this);
+        InstallStateStore.setPhase(this, InstallStateStore.PHASE_OBB);
+        startObbInstall(l);
+    }
 
+    private void startObbInstall(BundleLoader.Loaded l) {
+        if (l == null || l.source == null || l.app == null || l.app.packageName == null || l.app.packageName.isEmpty()) {
+            finishSuccess("Missing package metadata");
+            return;
+        }
+        resumeObbInstall = false;
+        final File dir = jobDir;
+        if (InstallStateStore.isActiveObbJob(dir)) {
+            obbRunning = true;
+            int currentProgress = InstallStateStore.getObbProgress(this);
+            setBusy(true);
+            setStep(4, R.string.step_obb);
+            setBar(currentProgress);
+            tvStatus.setText(getString(R.string.status_obb, currentProgress));
+            spinner.setVisibility(View.VISIBLE);
+            setBackBlocked(true);
+            return;
+        }
         obbRunning = true;
+        InstallStateStore.setObbProgress(this, 0);
+        InstallStateStore.registerActiveObbJob(dir);
         setBusy(true);
         setStep(4, R.string.step_obb);
         setBar(0);
+        spinner.setVisibility(View.VISIBLE);
+        setBackBlocked(true);
         lastReportKey = null;
         final long total = obbTotal(l);
         final String packageName = l.app.packageName;
@@ -882,6 +1243,7 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
                     int percent = total > 0 ? (int) Math.min(100L, done * 100L / total) : 0;
                     if (percent != last[0]) {
                         last[0] = percent;
+                        InstallStateStore.setObbProgress(getApplicationContext(), percent);
                         reporter.status(R.string.status_obb, percent);
                         reporter.progress(percent);
                     }
@@ -890,7 +1252,17 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
                 error = String.valueOf(e.getMessage());
             }
             final String result = error;
-            ui(() -> finishSuccess(result));
+            InstallStateStore.setObbResult(getApplicationContext(), result);
+            InstallStateStore.clearActiveObbJob(dir);
+            InstallStateStore.clearActiveJob(dir);
+            FileUtils.deleteRecursive(dir);
+            if (activityDestroyed) {
+                InstallEvents.publishTransient(new InstallEvents.Event(sessionId,
+                        result == null ? InstallEvents.STATUS_OBB_FINISHED_SUCCESS : InstallEvents.STATUS_OBB_FINISHED_FAILURE,
+                        result, packageName, null));
+            } else {
+                ui(() -> finishSuccess(result));
+            }
         });
     }
 
@@ -908,7 +1280,10 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
 
     private void finishSuccess(String obbError) {
         obbRunning = false;
+        committed = false;
+        commitInProgress = false;
         installed = true;
+        InstallStateStore.clear(this);
         setBackBlocked(false);
         setBusy(false);
         setBar(100);
@@ -920,7 +1295,21 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
         if (l != null && getPackageManager().getLaunchIntentForPackage(l.app.packageName) != null) {
             btnOpen.setVisibility(View.VISIBLE);
         }
+        closeLoadedSource();
         deleteJobAsync();
+    }
+
+    private void cleanupDestroyedJob(File dir, String message) {
+        InstallStateStore.State state = InstallStateStore.read(getApplicationContext());
+        int failedSession = state == null ? sessionId : state.sessionId;
+        String packageName = state == null ? null : state.packageName;
+        InstallStateStore.clear(getApplicationContext());
+        InstallStateStore.clearActiveJob(dir);
+        FileUtils.deleteRecursive(dir);
+        if (failedSession >= 0) {
+            InstallEvents.publish(new InstallEvents.Event(failedSession,
+                    PackageInstaller.STATUS_FAILURE, message, packageName, null));
+        }
     }
 
     private void openInstalledApp() {
