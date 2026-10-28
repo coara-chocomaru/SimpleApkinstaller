@@ -5,6 +5,8 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageInstaller;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 
 import com.coara.simpleapkinstaller.util.FileUtils;
 
@@ -13,16 +15,89 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public final class ApkInstaller {
     public interface Progress {
         void onProgress(int percent) throws IOException;
-        default void onSessionCreated(int sessionId) {}
-        default void onCommitStarted() {}
+        default void onCommitStarted(int sessionId) {}
+        default void onInstallerProgress(int sessionId, int percent) {}
+        default void onInstallerActive(int sessionId, boolean active) {}
+    }
+
+    private static final Object MONITOR_LOCK = new Object();
+    private static final Map<Integer, SessionMonitor> MONITORS = new HashMap<>();
+
+    private static final class SessionMonitor {
+        final PackageInstaller installer;
+        final PackageInstaller.SessionCallback callback;
+
+        SessionMonitor(PackageInstaller installer, PackageInstaller.SessionCallback callback) {
+            this.installer = installer;
+            this.callback = callback;
+        }
     }
 
     private ApkInstaller() {}
+
+    private static void startMonitoring(PackageInstaller installer, int sessionId, Progress progress) {
+        PackageInstaller.SessionCallback callback = new PackageInstaller.SessionCallback() {
+            @Override
+            public void onCreated(int changedSessionId) {}
+
+            @Override
+            public void onBadgingChanged(int changedSessionId) {}
+
+            @Override
+            public void onActiveChanged(int changedSessionId, boolean active) {
+                if (changedSessionId == sessionId) progress.onInstallerActive(sessionId, active);
+            }
+
+            @Override
+            public void onProgressChanged(int changedSessionId, float value) {
+                if (changedSessionId != sessionId || Float.isNaN(value) || Float.isInfinite(value)) return;
+                float bounded = Math.max(0f, Math.min(1f, value));
+                progress.onInstallerProgress(sessionId, Math.round(bounded * 100f));
+            }
+
+            @Override
+            public void onFinished(int changedSessionId, boolean success) {}
+        };
+
+        try {
+            installer.registerSessionCallback(callback, new Handler(Looper.getMainLooper()));
+            SessionMonitor previous;
+            synchronized (MONITOR_LOCK) {
+                previous = MONITORS.put(sessionId, new SessionMonitor(installer, callback));
+            }
+            if (previous != null) {
+                try {
+                    previous.installer.unregisterSessionCallback(previous.callback);
+                } catch (RuntimeException ignored) {
+                }
+            }
+        } catch (RuntimeException ignored) {
+            try {
+                installer.unregisterSessionCallback(callback);
+            } catch (RuntimeException ignoredAgain) {
+            }
+        }
+    }
+
+    public static void finishMonitoring(int sessionId) {
+        SessionMonitor monitor;
+        synchronized (MONITOR_LOCK) {
+            monitor = MONITORS.remove(sessionId);
+        }
+        if (monitor != null) {
+            try {
+                monitor.installer.unregisterSessionCallback(monitor.callback);
+            } catch (RuntimeException ignored) {
+            }
+        }
+    }
 
     public static int commit(Context context, List<File> apks, File base, String packageName, Progress progress) throws IOException {
         PackageInstaller installer = context.getPackageManager().getPackageInstaller();
@@ -41,7 +116,6 @@ public final class ApkInstaller {
         }
 
         int sessionId = installer.createSession(params);
-        progress.onSessionCreated(sessionId);
         PackageInstaller.Session session = null;
         try {
             session = installer.openSession(sessionId);
@@ -71,12 +145,12 @@ public final class ApkInstaller {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) flags |= PendingIntent.FLAG_MUTABLE;
             PendingIntent pending = PendingIntent.getBroadcast(context, sessionId, callback, flags);
 
+            progress.onCommitStarted(sessionId);
+            startMonitoring(installer, sessionId, progress);
             session.commit(pending.getIntentSender());
-            session.close();
-            session = null;
-            progress.onCommitStarted();
             return sessionId;
         } catch (IOException | RuntimeException e) {
+            finishMonitoring(sessionId);
             if (session != null) {
                 try {
                     session.abandon();

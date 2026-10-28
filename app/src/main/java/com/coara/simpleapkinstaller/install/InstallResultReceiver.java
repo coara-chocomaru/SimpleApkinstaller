@@ -16,6 +16,10 @@ public final class InstallResultReceiver extends BroadcastReceiver {
         String message = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);
         String packageName = intent.getStringExtra(PackageInstaller.EXTRA_PACKAGE_NAME);
 
+        if (status != PackageInstaller.STATUS_PENDING_USER_ACTION) {
+            ApkInstaller.finishMonitoring(sessionId);
+        }
+
         Intent confirm = null;
         if (status == PackageInstaller.STATUS_PENDING_USER_ACTION) {
             confirm = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
