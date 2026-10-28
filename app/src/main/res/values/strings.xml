@@ -21,7 +21,7 @@
     <string name="status_checking">Checking signatures…</string>
     <string name="status_signing">Signing (%1$d/%2$d): %3$s</string>
     <string name="status_writing">Sending to the installer… %1$d%%</string>
-    <string name="status_installing">System progress: %1$d%%\nAndroid reports progress only in stages. Library extraction and optimization are not reported.</string>
+    <string name="status_installing">Installing… %1$d%%</string>
     <string name="step_line">[%1$d/%2$d] %3$s</string>
     <string name="step_prepare">Preparing (extract and sign)</string>
     <string name="step_transfer">Sending to the installer</string>
