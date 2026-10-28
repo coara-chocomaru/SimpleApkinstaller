@@ -21,7 +21,7 @@
     <string name="status_checking">署名を確認中…</string>
     <string name="status_signing">署名中 (%1$d/%2$d): %3$s</string>
     <string name="status_writing">インストーラーへ転送中… %1$d%%</string>
-    <string name="status_installing">システム側の進捗: %1$d%%\nAndroidは進捗を段階的にしか公開しません。ライブラリ展開と最適化中は更新されません。</string>
+    <string name="status_installing">インストール中… %1$d%%</string>
     <string name="step_line">[%1$d/%2$d] %3$s</string>
     <string name="step_prepare">準備（展開・署名）</string>
     <string name="step_transfer">インストーラーへ転送</string>
