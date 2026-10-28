@@ -80,6 +80,7 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
     private boolean installed;
     private boolean installPromptShown;
     private int sessionId = -1;
+    private int lastSystemProgress;
     private Object lastReportKey;
 
     private BackGuard backGuard;
@@ -224,6 +225,10 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
 
             @Override
             public void onFinished(int id, boolean success) {
+                if (!success || !awaitingResult || !committed) return;
+                if (sessionId != -1 && id != sessionId) return;
+                BundleLoader.Loaded current = loaded;
+                if (current == null || !current.hasObb) showSystemProgress(1f);
             }
         };
         getPackageManager().getPackageInstaller().registerSessionCallback(sessionCallback);
@@ -241,14 +246,17 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
     }
 
     private void showSystemProgress(float value) {
+        if (Float.isNaN(value) || Float.isInfinite(value)) return;
         boolean installing = value >= 0.89f;
         if (confirmPending) {
             if (!installing) return;
             confirmPending = false;
             confirmShown = false;
         }
-        int percent = Math.round(Math.max(0f, Math.min(1f, (value - 0.8f) / 0.2f)) * 100f);
-        setStep(3, installing ? R.string.step_install : R.string.step_verify);
+        int percent = Math.round(Math.max(0f, Math.min(1f, value)) * 100f);
+        percent = Math.max(lastSystemProgress, percent);
+        lastSystemProgress = percent;
+        setStep(3, R.string.step_install);
         setBar(percent);
         spinner.setVisibility(View.VISIBLE);
         tvStatus.setText(getString(R.string.status_installing, percent));
@@ -260,10 +268,7 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
         if (awaitingResult && committed && confirmPending && confirmShown) {
             confirmPending = false;
             confirmShown = false;
-            setStep(3, R.string.step_verify);
-            setBar(0);
-            spinner.setVisibility(View.VISIBLE);
-            tvStatus.setText(getString(R.string.status_installing, 0));
+            showSystemProgress(Math.max(0.8f, lastSystemProgress / 100f));
         }
     }
 
@@ -725,6 +730,7 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
         final CancelToken currentToken = token;
         lastReportKey = null;
         sessionId = -1;
+        lastSystemProgress = 0;
         InstallEvents.discardPending();
         setBusy(true);
         committed = false;
@@ -751,7 +757,7 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
                     if (percent != last[0]) {
                         last[0] = percent;
                         reporter.status(R.string.status_writing, percent);
-                        reporter.progress(percent);
+                        reporter.progress(percent * 80 / 100);
                     }
                 });
                 committed = true;
@@ -783,7 +789,8 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
             case android.content.pm.PackageInstaller.STATUS_PENDING_USER_ACTION:
                 confirmPending = true;
                 setStep(3, R.string.step_confirm);
-                setBar(0);
+                lastSystemProgress = Math.max(lastSystemProgress, 80);
+                setBar(lastSystemProgress);
                 spinner.setVisibility(View.GONE);
                 tvStatus.setText("");
                 if (event.confirmIntent != null) {
@@ -904,6 +911,7 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
         installed = true;
         setBackBlocked(false);
         setBusy(false);
+        setBar(100);
         btnInstall.setEnabled(false);
         btnSelectSplits.setVisibility(View.GONE);
         tvStatus.setText(obbError == null ? getString(R.string.status_success) : getString(R.string.status_success_obb_failed, obbError));
