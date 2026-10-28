@@ -22,8 +22,9 @@
     <string name="status_signing">Signing (%1$d/%2$d): %3$s</string>
     <string name="status_writing">Sending to the installer… %1$d%%</string>
     <string name="status_waiting">Waiting for the system installer…</string>
-    <string name="status_install_progress">System installer working… %1$d%%</string>
-    <string name="status_installing_progress_unavailable">System installer working… obtaining progress</string>
+    <string name="status_user_action">Waiting for system confirmation…</string>
+    <string name="status_system_processing">System installer is processing the app…</string>
+    <string name="status_system_installing">System installing… %1$d%%</string>
     <string name="status_obb">Copying OBB files… %1$d%%</string>
     <string name="status_success">Installed successfully.</string>
     <string name="status_success_obb_failed">Installed, but the OBB files could not be copied: %1$s</string>
