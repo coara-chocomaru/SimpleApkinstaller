@@ -48,6 +48,14 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
     private static final int REQUEST_PICK = 101;
     private static final int REQUEST_STORAGE_READ = 102;
     private static final int REQUEST_STORAGE_WRITE = 103;
+    private static final int REQUEST_SELECTION_STORAGE = 104;
+    private static final int REQUEST_ALL_FILES_ACCESS = 105;
+    private static final int PENDING_STORAGE_NONE = 0;
+    private static final int PENDING_STORAGE_PICKER = 1;
+    private static final int PENDING_STORAGE_URI = 2;
+    private static final String STATE_PENDING_STORAGE_ACTION = "pending_storage_action";
+    private static final String STATE_PENDING_STORAGE_URI = "pending_storage_uri";
+    private static final String STATE_AWAITING_ALL_FILES = "awaiting_all_files";
     private static final String JOB_PREFIX = "job_";
 
     private View root;
@@ -70,6 +78,9 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
     private File jobDir;
     private BundleLoader.Loaded loaded;
     private Uri pendingReadUri;
+    private int pendingStorageAction = PENDING_STORAGE_NONE;
+    private Uri pendingStorageUri;
+    private boolean awaitingAllFilesResult;
 
     private volatile boolean busy;
     private volatile boolean awaitingResult;
@@ -161,10 +172,26 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
 
         worker = Executors.newSingleThreadExecutor();
 
+        if (savedInstanceState != null) {
+            pendingStorageAction = savedInstanceState.getInt(STATE_PENDING_STORAGE_ACTION, PENDING_STORAGE_NONE);
+            String savedUri = savedInstanceState.getString(STATE_PENDING_STORAGE_URI);
+            if (savedUri != null) {
+                try {
+                    pendingStorageUri = Uri.parse(savedUri);
+                } catch (RuntimeException ignored) {
+                    pendingStorageUri = null;
+                }
+            }
+            awaitingAllFilesResult = savedInstanceState.getBoolean(STATE_AWAITING_ALL_FILES, false);
+        }
+
         boolean restored = restorePendingInstall();
         clearStaleJobs(restored ? jobDir : null);
-        if (!restored) requestInstallPermissionIfNeeded();
-        if (!restored) handleIntent(getIntent());
+        if (!restored && pendingStorageAction == PENDING_STORAGE_NONE && !awaitingAllFilesResult) {
+            Uri incomingUri = extractIntentUri(getIntent());
+            if (incomingUri != null) handleIntent(getIntent());
+            else requestInstallPermissionIfNeeded();
+        }
         if (resumeObbInstall && loaded != null) startObbInstall(loaded);
     }
 
@@ -468,11 +495,20 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
     @Override
     protected void onResume() {
         super.onResume();
+        if (awaitingAllFilesResult) completeAllFilesAccessRequest();
         if (awaitingResult && committed && confirmPending && confirmShown) {
             confirmPending = false;
             confirmShown = false;
             showSystemProgress(0.8f);
         }
+    }
+
+    @Override
+    protected void onSaveInstanceState(Bundle outState) {
+        outState.putInt(STATE_PENDING_STORAGE_ACTION, pendingStorageAction);
+        if (pendingStorageUri != null) outState.putString(STATE_PENDING_STORAGE_URI, pendingStorageUri.toString());
+        outState.putBoolean(STATE_AWAITING_ALL_FILES, awaitingAllFilesResult);
+        super.onSaveInstanceState(outState);
     }
 
     private void unregisterSessionCallback() {
@@ -509,20 +545,22 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
     }
 
     private void handleIntent(Intent intent) {
-        if (intent == null || (intent.getFlags() & Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) != 0) return;
+        Uri uri = extractIntentUri(intent);
+        if (uri == null) return;
+        intent.setAction(Intent.ACTION_MAIN);
+        ensureSelectionStorageAccess(PENDING_STORAGE_URI, uri);
+    }
+
+    private Uri extractIntentUri(Intent intent) {
+        if (intent == null || (intent.getFlags() & Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) != 0) return null;
         String action = intent.getAction();
-        Uri uri = null;
-        if (Intent.ACTION_VIEW.equals(action)) {
-            uri = intent.getData();
-        } else if (Intent.ACTION_SEND.equals(action)) {
-            uri = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+        if (Intent.ACTION_VIEW.equals(action)) return intent.getData();
+        if (Intent.ACTION_SEND.equals(action)) {
+            return Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
                     ? intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri.class)
                     : legacyStream(intent);
         }
-        if (uri != null) {
-            intent.setAction(Intent.ACTION_MAIN);
-            loadUri(uri);
-        }
+        return null;
     }
 
     @SuppressWarnings("deprecation")
@@ -600,6 +638,10 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
             toast(R.string.toast_busy);
             return;
         }
+        ensureSelectionStorageAccess(PENDING_STORAGE_PICKER, null);
+    }
+
+    private void launchPicker() {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
         intent.setType("*/*");
@@ -607,15 +649,128 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
             startActivityForResult(intent, REQUEST_PICK);
         } catch (ActivityNotFoundException e) {
             toast(R.string.toast_unsupported);
+        } catch (RuntimeException e) {
+            toast(R.string.toast_unsupported);
         }
     }
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode == REQUEST_PICK && resultCode == RESULT_OK && data != null && data.getData() != null) {
-            loadUri(data.getData());
+        if (requestCode == REQUEST_ALL_FILES_ACCESS) {
+            completeAllFilesAccessRequest();
+            return;
         }
+        if (requestCode == REQUEST_PICK && resultCode == RESULT_OK && data != null && data.getData() != null) {
+            ensureSelectionStorageAccess(PENDING_STORAGE_URI, data.getData());
+        }
+    }
+
+    private void ensureSelectionStorageAccess(int action, Uri uri) {
+        if (busy || isFinishing() || isDestroyed()) {
+            if (busy) toast(R.string.toast_busy);
+            return;
+        }
+        if (hasSelectionStorageAccess()) {
+            pendingStorageAction = PENDING_STORAGE_NONE;
+            pendingStorageUri = null;
+            performSelectionAction(action, uri);
+            return;
+        }
+        pendingStorageAction = action;
+        pendingStorageUri = uri;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            showSelectionAllFilesAccessDialog();
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            try {
+                requestPermissions(new String[]{
+                        Manifest.permission.READ_EXTERNAL_STORAGE,
+                        Manifest.permission.WRITE_EXTERNAL_STORAGE
+                }, REQUEST_SELECTION_STORAGE);
+            } catch (RuntimeException e) {
+                rejectSelectionStorageAccess();
+            }
+        } else {
+            pendingStorageAction = PENDING_STORAGE_NONE;
+            pendingStorageUri = null;
+            performSelectionAction(action, uri);
+        }
+    }
+
+    private boolean hasSelectionStorageAccess() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            return Environment.isExternalStorageManager();
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            return checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+                    && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED;
+        }
+        return true;
+    }
+
+    @android.annotation.TargetApi(Build.VERSION_CODES.R)
+    private void showSelectionAllFilesAccessDialog() {
+        if (isFinishing() || isDestroyed()) return;
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.permission_select_files_title)
+                .setMessage(R.string.permission_select_files_message)
+                .setPositiveButton(R.string.action_open_settings, (dialog, which) -> launchAllFilesAccessSettings())
+                .setNegativeButton(R.string.action_close, (dialog, which) -> rejectSelectionStorageAccess())
+                .setOnCancelListener(dialog -> rejectSelectionStorageAccess())
+                .show();
+    }
+
+    @android.annotation.TargetApi(Build.VERSION_CODES.R)
+    private void launchAllFilesAccessSettings() {
+        Intent primary = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                Uri.parse("package:" + getPackageName()));
+        awaitingAllFilesResult = true;
+        try {
+            startActivityForResult(primary, REQUEST_ALL_FILES_ACCESS);
+            return;
+        } catch (RuntimeException first) {
+            Intent fallback = new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION);
+            try {
+                startActivityForResult(fallback, REQUEST_ALL_FILES_ACCESS);
+                return;
+            } catch (RuntimeException second) {
+                awaitingAllFilesResult = false;
+                toast(R.string.error_settings);
+                rejectSelectionStorageAccess();
+            }
+        }
+    }
+
+    private void completeAllFilesAccessRequest() {
+        if (!awaitingAllFilesResult || isFinishing() || isDestroyed()) return;
+        awaitingAllFilesResult = false;
+        if (hasSelectionStorageAccess()) {
+            int action = pendingStorageAction;
+            Uri uri = pendingStorageUri;
+            pendingStorageAction = PENDING_STORAGE_NONE;
+            pendingStorageUri = null;
+            performSelectionAction(action, uri);
+        } else {
+            rejectSelectionStorageAccess();
+        }
+    }
+
+    private void performSelectionAction(int action, Uri uri) {
+        if (action == PENDING_STORAGE_PICKER) {
+            launchPicker();
+        } else if (action == PENDING_STORAGE_URI && uri != null) {
+            requestInstallPermissionIfNeeded();
+            loadUri(uri);
+        }
+    }
+
+    private void rejectSelectionStorageAccess() {
+        pendingStorageAction = PENDING_STORAGE_NONE;
+        pendingStorageUri = null;
+        awaitingAllFilesResult = false;
+        toast(R.string.toast_permission_denied);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN) finishAffinity();
+        else finish();
     }
 
     private void resetUi() {
@@ -938,6 +1093,16 @@ public class MainActivity extends Activity implements View.OnClickListener, Inst
         } else if (requestCode == REQUEST_STORAGE_WRITE) {
             if (granted) onInstallClicked();
             else toast(R.string.toast_permission_denied);
+        } else if (requestCode == REQUEST_SELECTION_STORAGE) {
+            if (hasSelectionStorageAccess()) {
+                int action = pendingStorageAction;
+                Uri uri = pendingStorageUri;
+                pendingStorageAction = PENDING_STORAGE_NONE;
+                pendingStorageUri = null;
+                performSelectionAction(action, uri);
+            } else {
+                rejectSelectionStorageAccess();
+            }
         }
     }
 
