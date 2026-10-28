@@ -6,6 +6,10 @@ import java.util.ArrayList;
 import java.util.List;
 
 public final class InstallEvents {
+    public static final int STATUS_COMMIT_ACCEPTED = -1000;
+    public static final int STATUS_OBB_FINISHED_SUCCESS = -1001;
+    public static final int STATUS_OBB_FINISHED_FAILURE = -1002;
+
     public interface Listener {
         void onInstallEvent(Event event);
     }
@@ -32,13 +36,23 @@ public final class InstallEvents {
 
     private InstallEvents() {}
 
-    public static void publish(Event event) {
+    public static boolean publish(Event event) {
         Listener target;
         synchronized (LOCK) {
             target = listener;
             if (target == null) PENDING.add(event);
         }
         if (target != null) target.onInstallEvent(event);
+        return target != null;
+    }
+
+    public static boolean publishTransient(Event event) {
+        Listener target;
+        synchronized (LOCK) {
+            target = listener;
+        }
+        if (target != null) target.onInstallEvent(event);
+        return target != null;
     }
 
     public static void attach(Listener newListener) {

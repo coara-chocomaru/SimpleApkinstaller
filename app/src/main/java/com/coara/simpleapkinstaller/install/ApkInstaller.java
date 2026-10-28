@@ -22,7 +22,7 @@ public final class ApkInstaller {
 
     private ApkInstaller() {}
 
-    public static int commit(Context context, List<File> apks, File base, String packageName, Progress progress) throws IOException {
+    public static int commit(Context context, List<File> apks, File base, String packageName, File jobDir, boolean hasObb, List<String> obbEntries, Progress progress) throws IOException {
         PackageInstaller installer = context.getPackageManager().getPackageInstaller();
 
         long total = 0L;
@@ -41,6 +41,7 @@ public final class ApkInstaller {
         int sessionId = installer.createSession(params);
         PackageInstaller.Session session = null;
         try {
+            InstallStateStore.saveTransfer(context, sessionId, jobDir, packageName, hasObb, obbEntries);
             final PackageInstaller.Session active = installer.openSession(sessionId);
             session = active;
 
@@ -70,11 +71,34 @@ public final class ApkInstaller {
 
             Intent callback = new Intent(context, InstallResultReceiver.class);
             callback.setPackage(context.getPackageName());
+            callback.putExtra(InstallStateStore.EXTRA_JOB_PATH, jobDir == null ? "" : jobDir.getAbsolutePath());
+            callback.putExtra(InstallStateStore.EXTRA_HAS_OBB, hasObb);
             int flags = PendingIntent.FLAG_UPDATE_CURRENT;
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) flags |= PendingIntent.FLAG_MUTABLE;
             PendingIntent pending = PendingIntent.getBroadcast(context, sessionId, callback, flags);
 
+            InstallStateStore.setPhase(context, InstallStateStore.PHASE_COMMITTING);
             active.commit(pending.getIntentSender());
+            try {
+                InstallStateStore.setPhase(context, InstallStateStore.PHASE_INSTALL);
+            } catch (RuntimeException ignored) {
+            }
+            try {
+                if (jobDir != null) {
+                    if (hasObb) {
+                        File[] children = jobDir.listFiles();
+                        if (children != null) {
+                            for (File child : children) {
+                                if (!"source.bin".equals(child.getName())) FileUtils.deleteRecursive(child);
+                            }
+                        }
+                    } else {
+                        FileUtils.deleteRecursive(jobDir);
+                        InstallStateStore.clearActiveJob(jobDir);
+                    }
+                }
+            } catch (RuntimeException ignored) {
+            }
             return sessionId;
         } catch (IOException | RuntimeException e) {
             if (session != null) {
