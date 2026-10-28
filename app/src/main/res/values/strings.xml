@@ -76,6 +76,8 @@
 
     <string name="permission_install_title">Permission required</string>
     <string name="permission_install_message">Allow this app to install unknown apps in the system settings.</string>
+    <string name="permission_select_files_title">All files access required</string>
+    <string name="permission_select_files_message">Allow all files access to select and process APK files. If access is denied, the app will close.</string>
     <string name="permission_files_title">All files access required</string>
     <string name="permission_files_message">All files access is needed to copy OBB data. Allow it in the system settings.</string>
     <string name="error_settings">Could not open the settings screen.</string>
