@@ -48,6 +48,24 @@ android {
         includeInApk = false
         includeInBundle = false
     }
+    
+    packaging {
+        resources {
+            excludes += [
+                'kotlin/**',
+                'kotlin-tooling-metadata.json',
+                'DebugProbesKt.bin',
+                'META-INF/*.version',
+                'META-INF/*.kotlin_module',
+                'META-INF/com/android/build/gradle/app-metadata.properties',
+                'META-INF/**/LICENSE*',
+                'META-INF/**/NOTICE*',
+                'META-INF/DEPENDENCIES',
+                '**/*.kotlin_builtins',
+                '**/*.kotlin_metadata'
+            ]
+        }
+    }
 
     lint {
         abortOnError = false
